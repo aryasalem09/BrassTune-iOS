@@ -1005,9 +1005,11 @@ final class BrassTuneAppUITests: XCTestCase {
         XCTAssertTrue(app.descendants(matching: .any)["screen.practice"].waitForExistence(timeout: 8))
 
         let localizedTabLabels = ["يمارس", "الموالف", "المقاييس", "التقدم", "أكثر"]
+        let destinationIdentifiers = ["screen.practice", "screen.tuner", "screen.scales", "screen.progress", "screen.more"]
         let tabBar = app.tabBars.firstMatch
+        let usesNativeTabBar = tabBar.waitForExistence(timeout: 8)
         let primaryTabs: [XCUIElement]
-        if tabBar.waitForExistence(timeout: 8) {
+        if usesNativeTabBar {
             XCTAssertEqual(tabBar.buttons.count, localizedTabLabels.count)
             primaryTabs = (0..<tabBar.buttons.count).map { tabBar.buttons.element(boundBy: $0) }
         } else {
@@ -1030,9 +1032,39 @@ final class BrassTuneAppUITests: XCTestCase {
             }
         }
         XCTAssertEqual(primaryTabs.map(\.label).sorted(), localizedTabLabels.sorted())
-        for (index, tab) in primaryTabs.enumerated() {
-            XCTAssertGreaterThanOrEqual(tab.frame.height, 44, "Primary tab \(index) must retain a 44-point target at maximum Dynamic Type in RTL.")
-            XCTAssertTrue(tab.isHittable)
+        if usesNativeTabBar {
+            for (index, tab) in primaryTabs.enumerated() {
+                XCTAssertGreaterThanOrEqual(tab.frame.height, 44, "Primary tab \(index) must retain a 44-point target at maximum Dynamic Type in RTL.")
+                XCTAssertTrue(tab.isHittable)
+            }
+        } else {
+            for (index, tab) in primaryTabs.enumerated() {
+                XCTAssertGreaterThanOrEqual(tab.frame.width, 44, "Floating primary tab \(index) must retain a 44-point-wide target at maximum Dynamic Type in RTL.")
+                XCTAssertTrue(tab.isHittable)
+
+                // The native iPadOS floating strip can report a 43-point child
+                // accessibility frame inside its taller system pill. A 44-point
+                // target extends 22 points from center; probe 21.75 points in
+                // each direction to stay just inside that boundary while still
+                // landing outside a 43-point child frame.
+                let alternateIndex = (index + 1) % primaryTabs.count
+                for verticalOffset in [-21.75, 21.75] {
+                    primaryTabs[alternateIndex].tap()
+                    XCTAssertTrue(
+                        app.descendants(matching: .any)[destinationIdentifiers[alternateIndex]]
+                            .waitForExistence(timeout: 5),
+                        "Could not select the alternate tab before probing \(localizedTabLabels[index])."
+                    )
+                    tab.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+                        .withOffset(CGVector(dx: 0, dy: verticalOffset))
+                        .tap()
+                    XCTAssertTrue(
+                        app.descendants(matching: .any)[destinationIdentifiers[index]]
+                            .waitForExistence(timeout: 5),
+                        "Floating primary tab \(localizedTabLabels[index]) did not activate at vertical offset \(verticalOffset)."
+                    )
+                }
+            }
         }
 
         primaryTabs[2].tap()
@@ -2841,11 +2873,26 @@ final class BrassTuneAppUITests: XCTestCase {
         reachSettingsFromNormalDevLaunch(in: app)
         XCTAssertTrue(app.descendants(matching: .any)["settings.signOut"].waitForExistence(timeout: 8))
 
-        let labels = app.descendants(matching: .staticText).allElementsBoundByIndex.map(\.label)
-        XCTAssertTrue(
-            labels.contains { accountLabelDigestMatches($0, expectedDigest: accountDigest) },
-            "The signed-in `.dev` account did not match the explicitly authorized digest."
-        )
+        let settingsScroll = app.scrollViews["screen.settings"]
+        if settingsScroll.exists {
+            settingsScroll.swipeDown()
+            settingsScroll.swipeDown()
+        }
+        let labels = app.descendants(matching: .any).allElementsBoundByIndex.map(\.label)
+        let emailLikeCount = labels.reduce(into: 0) { count, label in
+            if !emailLikeSubstrings(in: label).isEmpty { count += 1 }
+        }
+        let accountStatusPresent = app.descendants(matching: .any)["settings.accountStatus"].exists
+        let profileEditorPresent = app.descendants(matching: .any)["screen.profileEditor"].exists
+        let evidence = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+        evidence.name = "Private physical existing-session Settings diagnostic"
+        evidence.lifetime = .deleteOnSuccess
+        add(evidence)
+        print("PHYSICAL_LIVE_GOOGLE_EXISTING_SESSION_DIAGNOSTIC emailLikeCount=\(emailLikeCount) accountStatusPresent=\(accountStatusPresent) profileEditorPresent=\(profileEditorPresent)")
+        guard labels.contains(where: { accountLabelDigestMatches($0, expectedDigest: accountDigest) }) else {
+            XCTFail("The signed-in `.dev` account did not match the explicitly authorized digest.")
+            return
+        }
         print("PHYSICAL_LIVE_GOOGLE_EXISTING_SESSION_IDENTITY_MATCHED")
     }
 

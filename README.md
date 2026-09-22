@@ -1,6 +1,6 @@
 # BrassTune iOS
 
-BrassTune is an iOS practice companion for brass musicians. It includes live pitch feedback, tuning and reference tones, metronome and drone practice, guided exercises, practice-history analytics, and optional account features.
+BrassTune is an iPhone and iPad practice companion for brass musicians. It includes live pitch feedback, tuning and reference tones, metronome and drone practice, guided exercises, practice-history analytics, and optional account features.
 
 Project attribution: Kelvin Guo, Arya Salem.
 

@@ -127,7 +127,7 @@ final class ReleaseSectionCoverageUITests: XCTestCase {
         XCTAssertNotEqual(referencePitch.label, initialPitch)
 
         let haptics = element("settings.successHaptics", in: app)
-        dragUp(in: settingsScroll)
+        bringIntoView(haptics, in: app, scrollView: settingsScroll)
         XCTAssertTrue(haptics.waitForExistence(timeout: 5))
         XCTAssertTrue(haptics.isHittable)
         let initialHaptics = haptics.value as? String
@@ -135,7 +135,10 @@ final class ReleaseSectionCoverageUITests: XCTestCase {
         XCTAssertNotEqual(haptics.value as? String, initialHaptics)
 
         let language = element("settings.languagePicker", in: app)
-        dragDown(in: settingsScroll)
+        for _ in 0..<5 {
+            if language.exists, language.isHittable { break }
+            dragDown(in: settingsScroll)
+        }
         XCTAssertTrue(language.waitForExistence(timeout: 5))
         XCTAssertTrue(language.isHittable)
         language.tap()

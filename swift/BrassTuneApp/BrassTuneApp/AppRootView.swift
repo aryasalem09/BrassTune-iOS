@@ -69,6 +69,7 @@ enum AppSceneAudioLifecycle {
 struct AppRootView: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var selectedTab: AppTab = .practice
     @State private var practicePath = NavigationPath()
@@ -125,8 +126,10 @@ struct AppRootView: View {
                 OnboardingView(isPresented: $onboardingPresented, selectedTab: $selectedTab)
             } else {
                 TabView(selection: $selectedTab) {
-                    practiceNavigation(path: $practicePath) {
-                        PracticeHomeView(selectedTab: $selectedTab)
+                    restoringContentSizeClass {
+                        practiceNavigation(path: $practicePath) {
+                            PracticeHomeView(selectedTab: $selectedTab)
+                        }
                     }
                     .id(practiceNavigationGeneration)
                     .tabItem {
@@ -134,38 +137,46 @@ struct AppRootView: View {
                     }
                     .tag(AppTab.practice)
 
-                    practiceNavigation {
-                        TunerView()
+                    restoringContentSizeClass {
+                        practiceNavigation {
+                            TunerView()
+                        }
                     }
                     .tabItem {
                         Label(AppTab.tuner.title, systemImage: AppTab.tuner.systemImage)
                     }
                     .tag(AppTab.tuner)
 
-                    practiceNavigation {
-                        ScalesTabView()
+                    restoringContentSizeClass {
+                        practiceNavigation {
+                            ScalesTabView()
+                        }
                     }
                     .tabItem {
                         Label(AppTab.scales.title, systemImage: AppTab.scales.systemImage)
                     }
                     .tag(AppTab.scales)
 
-                    practiceNavigation {
-                        ProgressTabView(selectedTab: $selectedTab)
+                    restoringContentSizeClass {
+                        practiceNavigation {
+                            ProgressTabView(selectedTab: $selectedTab)
+                        }
                     }
                     .tabItem {
                         Label(AppTab.progress.title, systemImage: AppTab.progress.systemImage)
                     }
                     .tag(AppTab.progress)
 
-                    practiceNavigation(path: $morePath) {
-                        MoreView(onboardingPresented: $onboardingPresented)
-                            .navigationDestination(for: MoreRoute.self) { route in
-                                switch route {
-                                case .classes:
-                                    ClassesView(selectedTab: $selectedTab)
+                    restoringContentSizeClass {
+                        practiceNavigation(path: $morePath) {
+                            MoreView(onboardingPresented: $onboardingPresented)
+                                .navigationDestination(for: MoreRoute.self) { route in
+                                    switch route {
+                                    case .classes:
+                                        ClassesView(selectedTab: $selectedTab)
+                                    }
                                 }
-                            }
+                        }
                     }
                     .tabItem {
                         Label(AppTab.more.title, systemImage: AppTab.more.systemImage)
@@ -176,6 +187,11 @@ struct AppRootView: View {
                 .transaction { transaction in
                     transaction.animation = nil
                 }
+                // iPadOS 18+ makes a regular-width TabView a floating top
+                // control. Its measured target was 43 pt at maximum Dynamic
+                // Type, below the 44 pt minimum. Request the native compact
+                // tab bar while each destination restores its actual width.
+                .environment(\.horizontalSizeClass, .compact)
                 .onChange(of: selectedTab) { oldTab, newTab in
                     if oldTab == .tuner, newTab != .tuner {
                         model.cancelRecordingStart()
@@ -300,6 +316,14 @@ struct AppRootView: View {
                 .interactiveDismissDisabled()
         }
         .nativeSuccessFeedback()
+    }
+
+    @ViewBuilder
+    private func restoringContentSizeClass<Content: View>(
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        content()
+            .environment(\.horizontalSizeClass, horizontalSizeClass)
     }
 
     private func practiceNavigation<Content: View>(

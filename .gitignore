@@ -1,0 +1,28 @@
+# macOS and Xcode user state
+.DS_Store
+**/xcuserdata/
+**/*.xcuserstate
+DerivedData/
+
+# SwiftPM and Xcode generated output
+**/.build/
+**/.swiftpm/
+build/
+*.xcarchive/
+*.xcresult/
+*.ipa
+
+# Credentials and local runtime data
+.env
+.env.*
+*.db
+*.sqlite
+*.sqlite3
+
+# Private media and test artifacts
+*.wav
+*.m4a
+*.webm
+*.mp3
+playwright-report/
+test-results/

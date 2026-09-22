@@ -1,0 +1,4268 @@
+import AVFoundation
+import BrassTuneCore
+import Darwin
+import Foundation
+import os
+import UIKit
+
+#if PHYSICAL_INSTRUMENTATION
+private enum NativeAudioLifecycleTrace {
+    static let log = OSLog(
+        subsystem: "com.aryasalem.BrassTune",
+        // The stock Time Profiler template records only the PointsOfInterest
+        // signpost category. This remains compile-gated, so production builds
+        // emit no lifecycle instrumentation.
+        category: .pointsOfInterest
+    )
+
+    static func id() -> OSSignpostID {
+        OSSignpostID(log: log)
+    }
+
+    static func span<T>(
+        _ name: StaticString,
+        id: OSSignpostID? = nil,
+        operation: () throws -> T
+    ) rethrows -> T {
+        let signpostID = id ?? self.id()
+        var succeeded: Int32 = 0
+        os_signpost(.begin, log: log, name: name, signpostID: signpostID)
+        defer {
+            os_signpost(
+                .end,
+                log: log,
+                name: name,
+                signpostID: signpostID,
+                "success=%{public}d",
+                succeeded
+            )
+        }
+        let result = try operation()
+        succeeded = 1
+        return result
+    }
+}
+#endif
+
+/// Test-only physical hooks for the global audio control plane. The closures
+/// carry no AVFoundation objects; production leaves this nil so the actor owns
+/// and configures `AVAudioSession.sharedInstance()` directly.
+struct NativeAudioControlPlaneHooks: Sendable {
+    enum Event: Equatable, Sendable {
+        case configure(NativeAudioSessionCoordinator.Configuration)
+        case activate
+        case deactivate
+        case captureInstallTap
+        case captureRemoveTap
+        case captureStart
+        case captureStop
+        case toneStart
+        case tonePlay
+        case toneStop
+        case toneTransition
+        case rebuildGraphs
+    }
+
+    let perform: @Sendable (Event) throws -> Void
+}
+
+/// Shared synchronous sequencing primitive for player-node graphs. The
+/// scheduling closure must only enqueue a buffer; completion is delivered by
+/// its callback later. Keeping this helper non-async prevents a serial audio
+/// actor from waiting for buffer consumption before it can execute stop/reset.
+enum NativeNonblockingAudioScheduling {
+    static func scheduleAndPlay(
+        schedule: () throws -> Void,
+        play: () throws -> Void
+    ) rethrows {
+        try schedule()
+        try play()
+    }
+}
+
+/// Equal-power is unnecessary here because both drone sources are normalized
+/// and routed through the same master mixer. A linear pair with a constant
+/// sum preserves headroom and gives a zero-discontinuity handoff boundary.
+enum NativeToneCrossfade {
+    static let stepCount = 24
+
+    static func gains(forStep step: Int) -> (outgoing: Float, incoming: Float) {
+        let progress = Float(min(stepCount, max(0, step))) / Float(stepCount)
+        return (1 - progress, progress)
+    }
+}
+
+/// The only executor allowed to own or operate BrassTune's AVAudioSession and
+/// capture/reference-tone AVAudioEngine graphs. AVFoundation objects never
+/// leave this actor; MainActor façades exchange only value requests/results.
+private actor NativeAudioControlPlane {
+    private var owners: Set<NativeAudioSessionCoordinator.Owner> = []
+    private var sessionIsActive = false
+    private var activeConfiguration: NativeAudioSessionCoordinator.Configuration?
+    private var deactivationGeneration: UInt64 = 0
+    private var pendingDeactivationTask: Task<Void, Never>?
+    private let deactivationDelay: Duration
+    private let hooks: NativeAudioControlPlaneHooks?
+    private var engine = AVAudioEngine()
+    private var toneSource: AVAudioSourceNode?
+    /// Keep the drone's gain in a dedicated mixer so a volume slider can
+    /// change it without stopping the oscillator or rebuilding its graph.
+    /// Stopping on every slider event created audible gaps and could leave a
+    /// rapid final update behind a stale stop command.
+    private var toneMixer: AVAudioMixerNode?
+    /// Each oscillator has its own mixer so pitch changes can crossfade two
+    /// phase-continuous render sources without changing the user volume.
+    private var toneSourceMixer: AVAudioMixerNode?
+    private var toneSourceAttached = false
+    private var toneVolumeRampTask: Task<Void, Never>?
+    private var toneRenderState = NativeToneRenderState()
+    private var outputGraphRequiresRebuild = false
+    private var inputTapInstalled = false
+    private var graphGeneration: UInt64 = 0
+    private var liveCaptureID: UUID?
+    private var liveStartedAt: Date?
+    private var liveCapturePipeline: NativeLiveCapturePipeline?
+
+    init(
+        hooks: NativeAudioControlPlaneHooks?,
+        deactivationDelay: Duration
+    ) {
+        self.hooks = hooks
+        self.deactivationDelay = deactivationDelay
+    }
+
+    @discardableResult
+    func acquire(
+        _ owner: NativeAudioSessionCoordinator.Owner,
+        configuration: NativeAudioSessionCoordinator.Configuration?
+    ) throws -> Bool {
+        guard !owners.contains(owner) else { return false }
+        guard owners.allSatisfy({ Self.areCompatible($0, owner) }) else {
+            throw NativeAudioEngineError.audioSessionOwnerConflict
+        }
+
+        let canReuseConfiguration = sessionIsActive && configuration == activeConfiguration
+        if !canReuseConfiguration,
+           owner != .metronome || !owners.contains(.capture),
+           let configuration {
+            try configureSession(for: configuration)
+            activeConfiguration = configuration
+        }
+
+        deactivationGeneration &+= 1
+        pendingDeactivationTask?.cancel()
+        pendingDeactivationTask = nil
+        owners.insert(owner)
+        guard !sessionIsActive else { return true }
+        do {
+#if PHYSICAL_INSTRUMENTATION
+            try NativeAudioLifecycleTrace.span("AudioSessionActivate") {
+                try perform(.activate)
+            }
+#else
+            try perform(.activate)
+#endif
+            sessionIsActive = true
+            return true
+        } catch {
+            owners.remove(owner)
+            activeConfiguration = nil
+            throw error
+        }
+    }
+
+    func release(
+        _ owner: NativeAudioSessionCoordinator.Owner,
+        deactivation: NativeAudioSessionCoordinator.DeactivationPolicy
+    ) {
+        guard owners.remove(owner) != nil, owners.isEmpty else { return }
+        deactivationGeneration &+= 1
+        let generation = deactivationGeneration
+        if deactivation == .deferred, deactivationDelay != .zero {
+            let delay = deactivationDelay
+            pendingDeactivationTask?.cancel()
+            pendingDeactivationTask = Task { [weak self] in
+                try? await Task.sleep(for: delay)
+                guard !Task.isCancelled else { return }
+                await self?.deactivateAfterDelay(generation: generation)
+            }
+            return
+        }
+        deactivateIfIdle(generation: generation)
+    }
+
+    func deactivateImmediatelyIfIdle() {
+        guard owners.isEmpty else { return }
+        deactivationGeneration &+= 1
+        pendingDeactivationTask?.cancel()
+        pendingDeactivationTask = nil
+        deactivateIfIdle(generation: deactivationGeneration)
+    }
+
+    func invalidateSessionConfiguration() {
+        activeConfiguration = nil
+    }
+
+    func invalidateAfterMediaServicesReset() {
+        deactivationGeneration &+= 1
+        pendingDeactivationTask?.cancel()
+        pendingDeactivationTask = nil
+        owners.removeAll()
+        activeConfiguration = nil
+        sessionIsActive = false
+    }
+
+    func activeOwners() -> Set<NativeAudioSessionCoordinator.Owner> { owners }
+
+    func currentGraphGeneration() -> UInt64 { graphGeneration }
+
+    func startCapture(_ request: NativeCaptureStartRequest) async throws -> NativeCaptureStartResult {
+        guard !inputTapInstalled else {
+            throw NativeAudioEngineError.inputTapAlreadyInstalled
+        }
+        let acquired = try acquire(
+            .capture,
+            configuration: request.audibleMetronome ? .captureWithMetronome : .capture
+        )
+        guard acquired else { throw NativeAudioEngineError.inputTapAlreadyInstalled }
+
+        do {
+            let startedAt = Date()
+            if hooks != nil {
+                try perform(.captureInstallTap)
+                inputTapInstalled = true
+                try perform(.captureStart)
+                liveCaptureID = request.captureID
+                liveStartedAt = startedAt
+                outputGraphRequiresRebuild = true
+                return NativeCaptureStartResult(
+                    generation: request.generation,
+                    captureID: request.captureID,
+                    startedAt: startedAt,
+                    graphGeneration: graphGeneration
+                )
+            }
+
+            let session = AVAudioSession.sharedInstance()
+            let inputNode = engine.inputNode
+            let inputFormat = inputNode.outputFormat(forBus: 0)
+            guard session.isInputAvailable,
+                  !session.currentRoute.inputs.isEmpty,
+                  inputFormat.channelCount > 0,
+                  inputFormat.sampleRate.isFinite,
+                  inputFormat.sampleRate > 0 else {
+                throw NativeAudioEngineError.inputUnavailable
+            }
+            let fileWriter = try request.recordingURL.map {
+                try NativeAudioFileWriter(destinationURL: $0, inputFormat: inputFormat)
+            }
+            guard let pipeline = NativeLiveCapturePipeline(
+                format: inputFormat,
+                writer: fileWriter,
+                instrumentId: request.instrumentId,
+                referencePitchHz: NativeReferencePitch.sanitized(request.referencePitchHz),
+                receiveFrame: request.receiveFrame,
+                receiveTimedFrame: request.receiveTimedFrame
+            ) else {
+                throw NativeAudioEngineError.inputUnavailable
+            }
+            liveCapturePipeline = pipeline
+            liveCaptureID = request.captureID
+            liveStartedAt = startedAt
+            inputNode.installTap(
+                onBus: 0,
+                bufferSize: 4096,
+                format: inputFormat,
+                block: Self.makeRenderTap(pipeline: pipeline)
+            )
+            inputTapInstalled = true
+            outputGraphRequiresRebuild = true
+            engine.prepare()
+            try engine.start()
+            return NativeCaptureStartResult(
+                generation: request.generation,
+                captureID: request.captureID,
+                startedAt: startedAt,
+                graphGeneration: graphGeneration
+            )
+        } catch {
+            await rollbackFailedCaptureStart()
+            throw error
+        }
+    }
+
+    func stopCapture(
+        generation: UInt64,
+        reason: NativeLiveCaptureCompletionReason,
+        discard: Bool = false,
+        graphIsValid: Bool = true
+    ) async -> NativeCaptureStopResult {
+        let captureID = liveCaptureID ?? UUID()
+        let startedAt = liveStartedAt ?? Date()
+        if graphIsValid {
+            if hooks != nil {
+                try? perform(.captureStop)
+                if inputTapInstalled { try? perform(.captureRemoveTap) }
+            } else {
+                engine.stop()
+                if inputTapInstalled { engine.inputNode.removeTap(onBus: 0) }
+            }
+        }
+        inputTapInstalled = false
+        let pipelineResult: NativeLiveCapturePipeline.FinishResult?
+        let discardedDroppedInputFrameCount: Int
+        if discard {
+            discardedDroppedInputFrameCount = liveCapturePipeline?.discard().droppedInputFrameCount ?? 0
+            pipelineResult = nil
+        } else {
+            discardedDroppedInputFrameCount = 0
+            pipelineResult = liveCapturePipeline?.finish()
+        }
+        liveCapturePipeline = nil
+        liveCaptureID = nil
+        liveStartedAt = nil
+        release(
+            .capture,
+            deactivation: reason == .userStopped ? .deferred : .immediate
+        )
+        return NativeCaptureStopResult(
+            generation: generation,
+            capture: NativeLiveCapture(
+                id: captureID,
+                startedAt: startedAt,
+                endedAt: Date(),
+                frames: pipelineResult?.frames ?? [],
+                droppedInputFrameCount: pipelineResult?.droppedInputFrameCount ?? discardedDroppedInputFrameCount,
+                recordingURL: pipelineResult?.recording?.recordingURL,
+                recordingRetentionFailure: pipelineResult?.recording?.retentionFailure,
+                completionReason: reason
+            )
+        )
+    }
+
+    /// Add a bounded CAF writer to an already-running tuner capture.  The
+    /// microphone tap stays installed; the capture consumer serializes the
+    /// boundary before it accepts the next buffer for this explicit take.
+    func beginCaptureTake(recordingURL: URL) throws -> Int {
+        guard let liveCapturePipeline else { throw NativeAudioEngineError.inputUnavailable }
+        return try liveCapturePipeline.beginRecording(destinationURL: recordingURL)
+    }
+
+    func finishCaptureTake() -> NativeCaptureTakeFinishResult? {
+        liveCapturePipeline?.finishRecording()
+    }
+
+    func discardCaptureTake() {
+        liveCapturePipeline?.discardRecording()
+    }
+
+    func startTone(_ request: NativeToneStartRequest) async throws -> UInt64 {
+        if outputGraphRequiresRebuild { rebuildGraphs() }
+        let acquired = try acquire(.tone, configuration: .tone)
+        if !acquired {
+            await stopTone(deactivation: .immediate)
+            _ = try acquire(.tone, configuration: .tone)
+        }
+        do {
+            toneVolumeRampTask?.cancel()
+            toneVolumeRampTask = nil
+            if hooks != nil {
+                try NativeNonblockingAudioScheduling.scheduleAndPlay(
+                    schedule: { try perform(.toneStart) },
+                    play: { try perform(.tonePlay) }
+                )
+                return request.generation
+            }
+            let format = try NativeToneRenderState.format()
+            // Oscillator normalization belongs to the render state; the
+            // user-facing level belongs to the dedicated mixer below.  That
+            // separation makes volume adjustments graph-preserving.
+            toneRenderState.configure(
+                frequenciesHz: request.frequenciesHz,
+                volume: 1,
+                sampleRate: format.sampleRate
+            )
+            if !toneSourceAttached {
+                let state = toneRenderState
+                toneSource = AVAudioSourceNode { _, _, frameCount, audioBufferList in
+                    state.render(frameCount: frameCount, audioBufferList: audioBufferList)
+                }
+                guard let toneSource else { throw NativeAudioEngineError.outputUnavailable }
+                toneMixer = AVAudioMixerNode()
+                toneSourceMixer = AVAudioMixerNode()
+                guard let toneMixer, let toneSourceMixer else {
+                    throw NativeAudioEngineError.outputUnavailable
+                }
+                engine.attach(toneSource)
+                engine.attach(toneMixer)
+                engine.attach(toneSourceMixer)
+                toneSourceMixer.outputVolume = 1
+                engine.connect(toneSource, to: toneSourceMixer, format: format)
+                engine.connect(toneSourceMixer, to: toneMixer, format: format)
+                engine.connect(toneMixer, to: engine.mainMixerNode, format: format)
+                toneSourceAttached = true
+            }
+            guard let toneMixer else { throw NativeAudioEngineError.outputUnavailable }
+            toneMixer.outputVolume = request.volume
+            engine.prepare()
+            try engine.start()
+            return request.generation
+        } catch {
+            if hooks == nil {
+                engine.stop()
+            }
+            release(.tone, deactivation: .immediate)
+            throw error
+        }
+    }
+
+    func stopTone(
+        deactivation: NativeAudioSessionCoordinator.DeactivationPolicy
+    ) async {
+        toneVolumeRampTask?.cancel()
+        toneVolumeRampTask = nil
+        if hooks != nil {
+            try? perform(.toneStop)
+        } else {
+            engine.stop()
+            // The source callback may still be rendering until the engine is
+            // quiesced. Clear its arrays only after the graph has stopped.
+            toneRenderState.stop()
+        }
+        release(.tone, deactivation: deactivation)
+    }
+
+    /// This command stays on the audio control actor so it is ordered after a
+    /// just-started tone, while avoiding an engine stop/start for every slider
+    /// value emitted by SwiftUI. A brief gain ramp prevents steps in the
+    /// waveform from becoming zipper noise during a drag.
+    func updateToneVolume(_ volume: Float) {
+        guard owners.contains(.tone), let toneMixer else { return }
+        toneVolumeRampTask?.cancel()
+        let initialVolume = toneMixer.outputVolume
+        guard abs(initialVolume - volume) > 0.000_1 else { return }
+        toneVolumeRampTask = Task { [weak self] in
+            guard let self else { return }
+            await self.rampToneVolume(
+                from: initialVolume,
+                to: volume,
+                stepCount: 6,
+                stepDuration: .milliseconds(5)
+            )
+        }
+    }
+
+    /// Replaces pitch content without stopping the output graph. The outgoing
+    /// source continues from its current phase while a separately configured
+    /// source fades in, eliminating the sample discontinuity that caused a
+    /// pop whenever the drone note or interval changed.
+    func transitionTone(_ request: NativeToneStartRequest) async throws -> UInt64 {
+        guard owners.contains(.tone) else { throw NativeAudioEngineError.outputUnavailable }
+        if hooks != nil {
+            try perform(.toneTransition)
+            return request.generation
+        }
+        guard toneSourceAttached,
+              let outgoingSource = toneSource,
+              let outgoingMixer = toneSourceMixer,
+              let toneMixer else {
+            throw NativeAudioEngineError.outputUnavailable
+        }
+        let format = try NativeToneRenderState.format()
+        let incomingState = NativeToneRenderState()
+        incomingState.configure(
+            frequenciesHz: request.frequenciesHz,
+            volume: 1,
+            sampleRate: format.sampleRate
+        )
+        let incomingSource = AVAudioSourceNode { _, _, frameCount, audioBufferList in
+            incomingState.render(frameCount: frameCount, audioBufferList: audioBufferList)
+        }
+        let incomingMixer = AVAudioMixerNode()
+        engine.attach(incomingSource)
+        engine.attach(incomingMixer)
+        incomingMixer.outputVolume = 0
+        engine.connect(incomingSource, to: incomingMixer, format: format)
+        engine.connect(incomingMixer, to: toneMixer, format: format)
+        engine.prepare()
+
+        for step in 1...NativeToneCrossfade.stepCount {
+            try await Task.sleep(for: .milliseconds(1))
+            guard owners.contains(.tone) else {
+                engine.disconnectNodeOutput(incomingSource)
+                engine.detach(incomingSource)
+                engine.detach(incomingMixer)
+                throw NativeAudioEngineError.outputUnavailable
+            }
+            let gains = NativeToneCrossfade.gains(forStep: step)
+            outgoingMixer.outputVolume = gains.outgoing
+            incomingMixer.outputVolume = gains.incoming
+        }
+        engine.disconnectNodeOutput(outgoingSource)
+        engine.disconnectNodeOutput(outgoingMixer)
+        engine.detach(outgoingSource)
+        engine.detach(outgoingMixer)
+        toneSource = incomingSource
+        toneSourceMixer = incomingMixer
+        toneRenderState = incomingState
+        return request.generation
+    }
+
+    func mediaServicesReset(
+        generation: UInt64,
+        captureReason: NativeLiveCaptureCompletionReason
+    ) async -> NativeCaptureStopResult? {
+        let hadCapture = owners.contains(.capture) || inputTapInstalled || liveCaptureID != nil
+        inputTapInstalled = false
+        outputGraphRequiresRebuild = true
+        invalidateAfterMediaServicesReset()
+        let captureResult = hadCapture
+            ? await stopCapture(
+                generation: generation,
+                reason: captureReason,
+                graphIsValid: false
+            )
+            : nil
+        owners.removeAll()
+        rebuildGraphs()
+        return captureResult
+    }
+
+    private func rollbackFailedCaptureStart() async {
+        if hooks != nil {
+            if inputTapInstalled { try? perform(.captureRemoveTap) }
+            try? perform(.captureStop)
+        } else {
+            engine.stop()
+            if inputTapInstalled { engine.inputNode.removeTap(onBus: 0) }
+        }
+        inputTapInstalled = false
+        _ = liveCapturePipeline?.discard()
+        liveCapturePipeline = nil
+        liveCaptureID = nil
+        liveStartedAt = nil
+        release(.capture, deactivation: .immediate)
+    }
+
+    private func rebuildGraphs() {
+        toneVolumeRampTask?.cancel()
+        toneVolumeRampTask = nil
+        if hooks != nil { try? perform(.rebuildGraphs) }
+        engine.stop()
+        engine = AVAudioEngine()
+        toneSource = nil
+        toneMixer = nil
+        toneSourceMixer = nil
+        toneSourceAttached = false
+        toneRenderState.stop()
+        inputTapInstalled = false
+        outputGraphRequiresRebuild = false
+        graphGeneration &+= 1
+    }
+
+    private func rampToneVolume(
+        from initialVolume: Float,
+        to targetVolume: Float,
+        stepCount: Int,
+        stepDuration: Duration
+    ) async {
+        for step in 1...max(1, stepCount) {
+            do {
+                try await Task.sleep(for: stepDuration)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled,
+                  owners.contains(.tone),
+                  let toneMixer else { return }
+            let progress = Float(step) / Float(max(1, stepCount))
+            toneMixer.outputVolume = initialVolume + (targetVolume - initialVolume) * progress
+        }
+    }
+
+    nonisolated private static func makeRenderTap(
+        pipeline: NativeLiveCapturePipeline
+    ) -> AVAudioNodeTapBlock {
+        { buffer, when in
+            let sampleRate = buffer.format.sampleRate
+            let timestampMs = Int(max(0, Double(when.sampleTime) / max(sampleRate, 1) * 1_000))
+            // Route/reset edge cases can supply a sample-time timestamp with
+            // no valid host clock. Do not fabricate an interval for the
+            // duplex gate; a zero pair is intentionally ignored downstream.
+            let hasValidHostTime = when.isHostTimeValid && when.hostTime > 0
+            let captureStartHostTime = hasValidHostTime ? when.hostTime : 0
+            let durationHostTicks = hasValidHostTime
+                ? AVAudioTime.hostTime(
+                    forSeconds: Double(buffer.frameLength) / max(sampleRate, 1)
+                )
+                : 0
+            pipeline.enqueueFromRenderTap(
+                buffer,
+                timestampMs: timestampMs,
+                captureStartHostTime: captureStartHostTime,
+                captureEndHostTime: captureStartHostTime &+ durationHostTicks
+            )
+        }
+    }
+
+    private func configureSession(
+        for configuration: NativeAudioSessionCoordinator.Configuration
+    ) throws {
+        if hooks != nil {
+            try perform(.configure(configuration))
+            return
+        }
+        let session = AVAudioSession.sharedInstance()
+        switch configuration {
+        case .capture, .captureWithMetronome:
+            try NativeCaptureSessionPolicy.configure(
+                audibleMetronome: configuration == .captureWithMetronome
+            ) { category, mode, options in
+                try session.setCategory(category, mode: mode, options: options)
+            }
+            try session.setPreferredIOBufferDuration(0.03)
+        case .tone:
+            try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+        case .metronome:
+            // A standalone metronome is output-only. Do not retain a capture
+            // category or Bluetooth HFP route when no microphone is in use.
+            try NativeMetronomeSessionPolicy.configure { category, mode, options in
+                try session.setCategory(category, mode: mode, options: options)
+            }
+        case .recordingPlayback:
+            try NativePlaybackSessionPolicy.configure { category, mode, options in
+                try session.setCategory(category, mode: mode, options: options)
+            }
+        }
+    }
+
+    private func perform(_ event: NativeAudioControlPlaneHooks.Event) throws {
+        if let hooks {
+            try hooks.perform(event)
+            return
+        }
+        let session = AVAudioSession.sharedInstance()
+        switch event {
+        case .activate:
+            try session.setActive(true)
+        case .deactivate:
+            try session.setActive(false, options: .notifyOthersOnDeactivation)
+        case .configure:
+            break
+        case .captureInstallTap, .captureRemoveTap, .captureStart, .captureStop,
+             .toneStart, .tonePlay, .toneStop, .toneTransition, .rebuildGraphs:
+            break
+        }
+    }
+
+    private func deactivateIfIdle(generation: UInt64) {
+        guard owners.isEmpty,
+              sessionIsActive,
+              generation == deactivationGeneration else { return }
+        do {
+#if PHYSICAL_INSTRUMENTATION
+            try NativeAudioLifecycleTrace.span("AudioSessionDeactivate") {
+                try perform(.deactivate)
+            }
+#else
+            try perform(.deactivate)
+#endif
+            sessionIsActive = false
+            activeConfiguration = nil
+        } catch {
+            // Retain the active marker after a failed deactivation. A media
+            // services reset explicitly clears it before the next acquire.
+        }
+    }
+
+    private func deactivateAfterDelay(generation: UInt64) {
+        deactivateIfIdle(generation: generation)
+        pendingDeactivationTask = nil
+    }
+
+    private static func areCompatible(
+        _ lhs: NativeAudioSessionCoordinator.Owner,
+        _ rhs: NativeAudioSessionCoordinator.Owner
+    ) -> Bool {
+        if lhs == rhs { return true }
+        if lhs == .metronome || rhs == .metronome {
+            return lhs == .capture || rhs == .capture
+        }
+        return false
+    }
+}
+
+private struct NativeCaptureStartRequest: Sendable {
+    let generation: UInt64
+    let captureID: UUID
+    let instrumentId: String
+    let referencePitchHz: Double
+    let recordingURL: URL?
+    let audibleMetronome: Bool
+    let receiveFrame: @Sendable (PitchFrame) -> Void
+    let receiveTimedFrame: (@Sendable (NativeTimedPitchFrame) -> Void)?
+}
+
+private struct NativeCaptureStartResult: Sendable {
+    let generation: UInt64
+    let captureID: UUID
+    let startedAt: Date
+    let graphGeneration: UInt64
+}
+
+private struct NativeCaptureStopResult: Sendable {
+    let generation: UInt64
+    let capture: NativeLiveCapture
+}
+
+private struct NativeToneStartRequest: Sendable {
+    let generation: UInt64
+    let frequenciesHz: [Double]
+    let volume: Float
+}
+
+private final class NativeAudioHookClosureBox: @unchecked Sendable {
+    let activate: () throws -> Void
+    let deactivate: () throws -> Void
+
+    init(
+        activate: @escaping () throws -> Void,
+        deactivate: @escaping () throws -> Void
+    ) {
+        self.activate = activate
+        self.deactivate = deactivate
+    }
+}
+
+@MainActor
+final class NativeAudioSessionCoordinator {
+    enum Owner: Hashable, Sendable { case capture, tone, metronome, recordingPlayback }
+    enum DeactivationPolicy: Sendable { case deferred, immediate }
+    enum Configuration: Equatable, Sendable { case capture, captureWithMetronome, tone, metronome, recordingPlayback }
+
+    static let shared = NativeAudioSessionCoordinator()
+
+    private struct InFlightAcquire {
+        let id: UUID
+        let task: Task<Bool, Error>
+    }
+
+    private var owners: Set<Owner> = []
+    private var inFlightAcquires: [Owner: InFlightAcquire] = [:]
+    private let controlPlane: NativeAudioControlPlane
+    private var commandTail: Task<Void, Never>?
+
+    init(
+        hooks: NativeAudioControlPlaneHooks? = nil,
+        deactivationDelay: Duration = .milliseconds(200)
+    ) {
+        controlPlane = NativeAudioControlPlane(
+            hooks: hooks,
+            deactivationDelay: deactivationDelay
+        )
+    }
+
+    convenience init(
+        activateSession: @escaping () throws -> Void,
+        deactivateSession: @escaping () throws -> Void,
+        deactivationDelay: Duration = .milliseconds(200)
+    ) {
+        let box = NativeAudioHookClosureBox(
+            activate: activateSession,
+            deactivate: deactivateSession
+        )
+        self.init(
+            hooks: NativeAudioControlPlaneHooks { event in
+                switch event {
+                case .activate: try box.activate()
+                case .deactivate: try box.deactivate()
+                default: break
+                }
+            },
+            deactivationDelay: deactivationDelay
+        )
+    }
+
+    @discardableResult
+    func acquire(
+        _ owner: Owner,
+        configuration: Configuration? = nil
+    ) async throws -> Bool {
+        try await acquireTask(owner, configuration: configuration).value
+    }
+
+    func acquireTask(
+        _ owner: Owner,
+        configuration: Configuration? = nil
+    ) throws -> Task<Bool, Error> {
+        if let inFlight = inFlightAcquires[owner] { return inFlight.task }
+        if owners.contains(owner) { return Task { false } }
+        try reserveCompatible(owner)
+        let physicalTask = enqueueThrowingTask { plane in
+            try await plane.acquire(owner, configuration: configuration)
+        }
+        let id = UUID()
+        let readinessTask = Task { @MainActor [weak self] in
+            do {
+                let acquired = try await physicalTask.value
+                if self?.inFlightAcquires[owner]?.id == id {
+                    self?.inFlightAcquires.removeValue(forKey: owner)
+                }
+                return acquired
+            } catch {
+                if self?.inFlightAcquires[owner]?.id == id {
+                    self?.inFlightAcquires.removeValue(forKey: owner)
+                    self?.owners.remove(owner)
+                }
+                throw error
+            }
+        }
+        inFlightAcquires[owner] = InFlightAcquire(id: id, task: readinessTask)
+        return readinessTask
+    }
+
+    fileprivate func startCapture(_ request: NativeCaptureStartRequest) throws -> Task<NativeCaptureStartResult, Error> {
+        try reserve(.capture)
+        return enqueueThrowingTask { plane in
+            try await plane.startCapture(request)
+        }
+    }
+
+    fileprivate func stopCapture(
+        generation: UInt64,
+        reason: NativeLiveCaptureCompletionReason,
+        discard: Bool = false,
+        graphIsValid: Bool = true
+    ) -> Task<NativeCaptureStopResult, Never> {
+        owners.remove(.capture)
+        inFlightAcquires.removeValue(forKey: .capture)
+        return enqueueTask { plane in
+            await plane.stopCapture(
+                generation: generation,
+                reason: reason,
+                discard: discard,
+                graphIsValid: graphIsValid
+            )
+        }
+    }
+
+    fileprivate func beginCaptureTake(recordingURL: URL) -> Task<Int, Error> {
+        enqueueThrowingTask { plane in
+            try await plane.beginCaptureTake(recordingURL: recordingURL)
+        }
+    }
+
+    fileprivate func finishCaptureTake() -> Task<NativeCaptureTakeFinishResult?, Never> {
+        enqueueTask { plane in
+            await plane.finishCaptureTake()
+        }
+    }
+
+    fileprivate func discardCaptureTake() {
+        enqueueNoWait { plane in
+            await plane.discardCaptureTake()
+        }
+    }
+
+    fileprivate func startTone(_ request: NativeToneStartRequest) throws -> Task<UInt64, Error> {
+        try reserve(.tone)
+        return enqueueThrowingTask { plane in
+            try await plane.startTone(request)
+        }
+    }
+
+    func rollbackLogicalOwner(_ owner: Owner) {
+        owners.remove(owner)
+        inFlightAcquires.removeValue(forKey: owner)
+    }
+
+    func stopTone(deactivation: DeactivationPolicy = .deferred) {
+        guard owners.remove(.tone) != nil else { return }
+        inFlightAcquires.removeValue(forKey: .tone)
+        enqueueNoWait { plane in
+            await plane.stopTone(deactivation: deactivation)
+        }
+    }
+
+    /// Preserve a running drone across high-frequency slider updates. The
+    /// control-plane queue makes this execute after any in-flight start.
+    func updateToneVolume(_ volume: Float) {
+        guard owners.contains(.tone) else { return }
+        enqueueNoWait { plane in
+            await plane.updateToneVolume(volume)
+        }
+    }
+
+    fileprivate func transitionTone(_ request: NativeToneStartRequest) throws -> Task<UInt64, Error> {
+        guard owners.contains(.tone) else { throw NativeAudioEngineError.outputUnavailable }
+        return enqueueThrowingTask { plane in
+            try await plane.transitionTone(request)
+        }
+    }
+
+    fileprivate func handleMediaServicesReset(
+        generation: UInt64,
+        captureReason: NativeLiveCaptureCompletionReason = .interruption
+    ) -> Task<NativeCaptureStopResult?, Never> {
+        owners.removeAll()
+        inFlightAcquires.removeAll()
+        return enqueueTask { plane in
+            await plane.mediaServicesReset(
+                generation: generation,
+                captureReason: captureReason
+            )
+        }
+    }
+
+    func release(_ owner: Owner, deactivation: DeactivationPolicy = .deferred) {
+        guard owners.remove(owner) != nil else { return }
+        inFlightAcquires.removeValue(forKey: owner)
+        enqueueNoWait { plane in
+            await plane.release(owner, deactivation: deactivation)
+        }
+    }
+
+    func deactivateImmediatelyIfIdle() {
+        guard owners.isEmpty else { return }
+        enqueueNoWait { plane in
+            await plane.deactivateImmediatelyIfIdle()
+        }
+    }
+
+    var activeOwners: Set<Owner> { owners }
+
+    func isActive(_ owner: Owner) -> Bool { owners.contains(owner) }
+
+    /// Route loss, interruptions, and media-service resets can change the
+    /// system session even if our deferred handoff timer has not fired.
+    func invalidateSessionConfiguration() {
+        enqueueNoWait { plane in
+            await plane.invalidateSessionConfiguration()
+        }
+    }
+
+    /// Media services reset invalidates AVAudioSession itself, even if a
+    /// best-effort deactivation would fail. The next acquire must therefore
+    /// configure and activate from scratch rather than trusting a stale flag.
+    func invalidateAfterMediaServicesReset() {
+        owners.removeAll()
+        inFlightAcquires.removeAll()
+        enqueueNoWait { plane in
+            await plane.invalidateAfterMediaServicesReset()
+        }
+    }
+
+    func flush() async {
+        await commandTail?.value
+    }
+
+    func physicalActiveOwners() async -> Set<Owner> {
+        await flush()
+        return await controlPlane.activeOwners()
+    }
+
+    func graphGeneration() async -> UInt64 {
+        await flush()
+        return await controlPlane.currentGraphGeneration()
+    }
+
+    private func reserve(_ owner: Owner) throws {
+        guard !owners.contains(owner) else {
+            throw NativeAudioEngineError.inputTapAlreadyInstalled
+        }
+        guard owners.allSatisfy({ Self.areCompatible($0, owner) }) else {
+            throw NativeAudioEngineError.audioSessionOwnerConflict
+        }
+        owners.insert(owner)
+    }
+
+    private func reserveCompatible(_ owner: Owner) throws {
+        guard owners.allSatisfy({ Self.areCompatible($0, owner) }) else {
+            throw NativeAudioEngineError.audioSessionOwnerConflict
+        }
+        owners.insert(owner)
+    }
+
+    private func enqueue<Result: Sendable>(
+        _ operation: @escaping @Sendable (NativeAudioControlPlane) async throws -> Result
+    ) async throws -> Result {
+        let previous = commandTail
+        let plane = controlPlane
+        let task = Task<Result, Error> {
+            await previous?.value
+            return try await operation(plane)
+        }
+        commandTail = Task { _ = try? await task.value }
+        return try await task.value
+    }
+
+    private func enqueueTask<Result: Sendable>(
+        _ operation: @escaping @Sendable (NativeAudioControlPlane) async -> Result
+    ) -> Task<Result, Never> {
+        let previous = commandTail
+        let plane = controlPlane
+        let task = Task<Result, Never> {
+            await previous?.value
+            return await operation(plane)
+        }
+        commandTail = Task { _ = await task.value }
+        return task
+    }
+
+    private func enqueueThrowingTask<Result: Sendable>(
+        _ operation: @escaping @Sendable (NativeAudioControlPlane) async throws -> Result
+    ) -> Task<Result, Error> {
+        let previous = commandTail
+        let plane = controlPlane
+        let task = Task<Result, Error> {
+            await previous?.value
+            return try await operation(plane)
+        }
+        commandTail = Task { _ = try? await task.value }
+        return task
+    }
+
+    private func enqueueNoWait(
+        _ operation: @escaping @Sendable (NativeAudioControlPlane) async -> Void
+    ) {
+        let task: Task<Void, Never> = enqueueTask(operation)
+        commandTail = task
+    }
+
+    private static func areCompatible(_ lhs: Owner, _ rhs: Owner) -> Bool {
+        if lhs == rhs { return true }
+        // The metronome may coexist with capture only as a visual clock; its
+        // output implementation detects capture and releases itself. All
+        // other audible capture/playback/tone handoffs must be explicit.
+        if lhs == .metronome || rhs == .metronome {
+            return lhs == .capture || rhs == .capture
+        }
+        return false
+    }
+}
+
+/// A single source of truth for persisted and live A4 values. Rejecting NaN
+/// and infinity avoids propagating invalid values into logarithmic pitch math.
+enum NativeReferencePitch {
+    static let defaultHz = 440.0
+    static let allowedRange = 430.0...450.0
+
+    static func sanitized(_ value: Double) -> Double {
+        guard value.isFinite, allowedRange.contains(value) else { return defaultHz }
+        return value
+    }
+}
+
+enum NativeLiveCaptureCompletionReason: Equatable, Sendable {
+    case userStopped
+    case interruption
+    case routeLoss
+}
+
+enum NativeRecordingRetentionFailure: Equatable, Sendable {
+    case durationLimitReached
+    case sizeLimitReached
+    case writeFailed
+}
+
+struct NativeLiveCapture: Equatable, Identifiable, Sendable {
+    let id: UUID
+    let startedAt: Date
+    let endedAt: Date
+    let frames: [PitchFrame]
+    let droppedInputFrameCount: Int
+    let recordingURL: URL?
+    let recordingRetentionFailure: NativeRecordingRetentionFailure?
+    let completionReason: NativeLiveCaptureCompletionReason
+
+    init(
+        id: UUID,
+        startedAt: Date,
+        endedAt: Date,
+        frames: [PitchFrame],
+        droppedInputFrameCount: Int = 0,
+        recordingURL: URL?,
+        recordingRetentionFailure: NativeRecordingRetentionFailure?,
+        completionReason: NativeLiveCaptureCompletionReason
+    ) {
+        self.id = id
+        self.startedAt = startedAt
+        self.endedAt = endedAt
+        self.frames = frames
+        self.droppedInputFrameCount = droppedInputFrameCount
+        self.recordingURL = recordingURL
+        self.recordingRetentionFailure = recordingRetentionFailure
+        self.completionReason = completionReason
+    }
+}
+
+/// One explicitly bounded tuner take. Its pitch frames and CAF writer share
+/// the capture-consumer boundary, avoiding a race through the main actor.
+struct NativeCaptureTakeFinishResult: Sendable {
+    let recording: NativeAudioFileWriter.FinishResult?
+    let frames: [PitchFrame]
+    let droppedInputFrameCount: Int
+}
+
+struct NativeRecordingRetentionQuota: Equatable {
+    /// A five-minute cap keeps local, uncompressed CAF takes bounded while
+    /// still covering a focused practice pass.
+    static let shipping = NativeRecordingRetentionQuota(
+        maximumDuration: 5 * 60,
+        maximumBytes: 64 * 1024 * 1024
+    )
+
+    let maximumDuration: TimeInterval
+    let maximumBytes: Int64
+
+    func failure(
+        frameCount: Int64,
+        sampleRate: Double,
+        estimatedBytes: Int64
+    ) -> NativeRecordingRetentionFailure? {
+        if sampleRate > 0, Double(frameCount) / sampleRate > maximumDuration {
+            return .durationLimitReached
+        }
+        if estimatedBytes > maximumBytes {
+            return .sizeLimitReached
+        }
+        return nil
+    }
+}
+
+struct NativePlaybackSessionPolicy {
+    static func configure(
+        _ apply: (AVAudioSession.Category, AVAudioSession.Mode, AVAudioSession.CategoryOptions) throws -> Void
+    ) rethrows {
+        // `.playback` deliberately ignores the Ring/Silent switch. A saved
+        // practice take should behave like media, not like a notification.
+        try apply(.playback, .default, [])
+    }
+}
+
+struct NativeMetronomeSessionPolicy {
+    static func configure(
+        _ apply: (AVAudioSession.Category, AVAudioSession.Mode, AVAudioSession.CategoryOptions) throws -> Void
+    ) rethrows {
+        try apply(.playback, .default, [.mixWithOthers])
+    }
+}
+
+struct NativeCaptureSessionPolicy {
+    static func configure(
+        audibleMetronome: Bool,
+        _ apply: (AVAudioSession.Category, AVAudioSession.Mode, AVAudioSession.CategoryOptions) throws -> Void
+    ) rethrows {
+        // Measurement disables output dynamics and lowers speaker playback.
+        // Preserve its clean input for tuner-only listening, but select normal
+        // duplex output before starting a combined tuner/metronome capture.
+        try apply(
+            .playAndRecord,
+            audibleMetronome ? .default : .measurement,
+            [.allowBluetoothHFP, .defaultToSpeaker, .mixWithOthers]
+        )
+    }
+}
+
+/// A preallocated, bounded PCM pool shared by the render callback and the
+/// serial file consumer. Its lock protects only slot ownership and is never
+/// held during copying, file I/O, or pitch analysis.
+private final class NativeCaptureBufferPool: @unchecked Sendable {
+    final class Slot: @unchecked Sendable {
+        let index: Int
+        let buffer: AVAudioPCMBuffer
+
+        init(index: Int, buffer: AVAudioPCMBuffer) {
+            self.index = index
+            self.buffer = buffer
+        }
+    }
+
+    private let lock = NSLock()
+    private let slots: [Slot]
+    private var availableIndices: [Int]
+    private var failedClosed = false
+
+    init?(format: AVAudioFormat, frameCapacity: AVAudioFrameCount, slotCount: Int = 2) {
+        guard frameCapacity > 0, slotCount > 0 else { return nil }
+        var preparedSlots: [Slot] = []
+        preparedSlots.reserveCapacity(slotCount)
+        for index in 0..<slotCount {
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCapacity) else {
+                return nil
+            }
+            preparedSlots.append(Slot(index: index, buffer: buffer))
+        }
+        slots = preparedSlots
+        var indices = Array(preparedSlots.indices)
+        indices.reserveCapacity(slotCount)
+        availableIndices = indices
+    }
+
+    func acquire() -> Slot? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !failedClosed, let index = availableIndices.popLast() else {
+            failedClosed = true
+            return nil
+        }
+        return slots[index]
+    }
+
+    func release(_ slot: Slot) {
+        lock.lock()
+        availableIndices.append(slot.index)
+        lock.unlock()
+    }
+
+    func failClosed() {
+        lock.lock()
+        failedClosed = true
+        lock.unlock()
+    }
+
+    func hasFailure() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return failedClosed
+    }
+}
+
+final class NativeAudioFileWriter: @unchecked Sendable {
+    struct FinishResult {
+        let recordingURL: URL?
+        let retentionFailure: NativeRecordingRetentionFailure?
+    }
+
+    /// File writes intentionally live off the render thread. The callback only
+    /// claims a preallocated PCM slot; when the writer cannot keep up, the take
+    /// is marked unusable instead of growing memory or callback latency.
+    private let bufferPool: NativeCaptureBufferPool
+    private let writerQueue = DispatchQueue(
+        label: "com.brasstune.native.recording-writer",
+        qos: .utility
+    )
+    private var audioFile: AVAudioFile?
+    private var retentionFailure: NativeRecordingRetentionFailure?
+    private var writtenFrames: Int64 = 0
+    private var estimatedBytes: Int64 = 0
+    private let sampleRate: Double
+    private let bytesPerFrame: Int64
+    private let quota: NativeRecordingRetentionQuota
+
+    let destinationURL: URL
+
+    init(
+        destinationURL: URL,
+        inputFormat: AVAudioFormat,
+        recordingBufferFrameCapacity: AVAudioFrameCount = 4096,
+        quota: NativeRecordingRetentionQuota = .shipping
+    ) throws {
+        self.destinationURL = destinationURL
+        self.quota = quota
+        self.sampleRate = inputFormat.sampleRate
+        let declaredBytesPerFrame = Int64(inputFormat.streamDescription.pointee.mBytesPerFrame)
+        let bytesPerBufferFrame = max(
+            1,
+            declaredBytesPerFrame == 0
+                ? Int64(MemoryLayout<Float>.size)
+                : declaredBytesPerFrame
+        )
+        // In non-interleaved PCM, the ASBD byte count is per channel buffer.
+        // Account for all channel buffers before deciding a take can grow.
+        let bufferCount = inputFormat.isInterleaved ? 1 : max(1, Int64(inputFormat.channelCount))
+        self.bytesPerFrame = bytesPerBufferFrame * bufferCount
+        guard let bufferPool = NativeCaptureBufferPool(
+            format: inputFormat,
+            frameCapacity: recordingBufferFrameCapacity
+        ) else {
+            throw NativeAudioEngineError.inputUnavailable
+        }
+        self.bufferPool = bufferPool
+        try FileManager.default.createDirectory(
+            at: destinationURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        audioFile = try AVAudioFile(
+            forWriting: destinationURL,
+            settings: inputFormat.settings,
+            commonFormat: inputFormat.commonFormat,
+            interleaved: inputFormat.isInterleaved
+        )
+        try? FileManager.default.setAttributes(
+            [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+            ofItemAtPath: destinationURL.path
+        )
+        var resourceValues = URLResourceValues()
+        resourceValues.isExcludedFromBackup = true
+        var mutableURL = destinationURL
+        try? mutableURL.setResourceValues(resourceValues)
+    }
+
+    /// Called from AVAudioEngine's tap. It never performs file I/O or creates
+    /// PCM buffers: audio is copied into an already allocated bounded slot.
+    func enqueueCopy(from buffer: AVAudioPCMBuffer) {
+        guard let slot = bufferPool.acquire() else { return }
+        guard Self.copy(buffer, into: slot.buffer) else {
+            bufferPool.failClosed()
+            bufferPool.release(slot)
+            return
+        }
+        writerQueue.async { [self] in
+            defer { self.bufferPool.release(slot) }
+            self.write(slot.buffer)
+        }
+    }
+
+    private func write(_ buffer: AVAudioPCMBuffer) {
+        guard let audioFile, retentionFailure == nil else { return }
+        let nextFrameCount = writtenFrames + Int64(buffer.frameLength)
+        let nextEstimatedBytes = estimatedBytes + Int64(buffer.frameLength) * bytesPerFrame
+        if let quotaFailure = quota.failure(
+            frameCount: nextFrameCount,
+            sampleRate: sampleRate,
+            estimatedBytes: nextEstimatedBytes
+        ) {
+            retentionFailure = quotaFailure
+            return
+        }
+        do {
+            try audioFile.write(from: buffer)
+            writtenFrames = nextFrameCount
+            estimatedBytes = nextEstimatedBytes
+        } catch {
+            retentionFailure = .writeFailed
+        }
+    }
+
+    /// Used by the pre-created live-capture consumer, never by the render tap.
+    func writeFromConsumer(_ buffer: AVAudioPCMBuffer) {
+        writerQueue.sync { write(buffer) }
+    }
+
+    /// The producer detected an overflow. Record the failure off the render
+    /// callback so a partial CAF can never be surfaced as a complete take.
+    func failClosedFromConsumer() {
+        writerQueue.sync {
+            if retentionFailure == nil {
+                retentionFailure = .writeFailed
+            }
+        }
+    }
+
+    func finish() -> FinishResult {
+        let failure = writerQueue.sync { () -> NativeRecordingRetentionFailure? in
+            // A dropped writer buffer means the file cannot honestly be
+            // presented as a complete listen-back recording.
+            if bufferPool.hasFailure(), retentionFailure == nil {
+                retentionFailure = .writeFailed
+            }
+            let failure = retentionFailure
+            audioFile = nil
+            return failure
+        }
+
+        let preservesCappedAudio = failure == .durationLimitReached || failure == .sizeLimitReached
+        guard (failure == nil || preservesCappedAudio),
+              FileManager.default.fileExists(atPath: destinationURL.path),
+              ((try? destinationURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) > 0 else {
+            try? FileManager.default.removeItem(at: destinationURL)
+            return FinishResult(recordingURL: nil, retentionFailure: failure)
+        }
+        return FinishResult(recordingURL: destinationURL, retentionFailure: failure)
+    }
+
+    func discard() {
+        writerQueue.sync {
+            audioFile = nil
+        }
+        try? FileManager.default.removeItem(at: destinationURL)
+    }
+
+    private static func copy(_ buffer: AVAudioPCMBuffer, into copiedBuffer: AVAudioPCMBuffer) -> Bool {
+        guard buffer.frameLength <= copiedBuffer.frameCapacity else { return false }
+        copiedBuffer.frameLength = buffer.frameLength
+        let sourceList = UnsafeMutableAudioBufferListPointer(buffer.mutableAudioBufferList)
+        let destinationList = UnsafeMutableAudioBufferListPointer(copiedBuffer.mutableAudioBufferList)
+        guard sourceList.count == destinationList.count else { return false }
+        for index in sourceList.indices {
+            guard let source = sourceList[index].mData,
+                  let destination = destinationList[index].mData else { return false }
+            let byteCount = min(sourceList[index].mDataByteSize, destinationList[index].mDataByteSize)
+            memcpy(destination, source, Int(byteCount))
+        }
+        return true
+    }
+}
+
+/// Lower-target lock-free Int32 wrapper. `OSAtomic` remains available to the
+/// project's deployment target (deprecated, but intentionally used here until
+/// the target can ship a C11-atomic shim). No render-tap operation waits on an
+/// app lock or allocates memory.
+private final class NativeLegacyAtomicInt32: @unchecked Sendable {
+    private var storage: Int32
+
+    init(_ initialValue: Int32) {
+        storage = initialValue
+    }
+
+    func load() -> Int32 {
+        OSAtomicAdd32Barrier(0, &storage)
+    }
+
+    func store(_ value: Int32) {
+        while true {
+            let current = load()
+            if OSAtomicCompareAndSwap32Barrier(current, value, &storage) { return }
+        }
+    }
+
+    @discardableResult
+    func increment() -> Int32 {
+        OSAtomicIncrement32Barrier(&storage)
+    }
+}
+
+/// Companion to the bounded producer/consumer indices for capture host-time
+/// metadata. Values are written before the producer index is published and
+/// read only after the consumer observes that publication.
+private final class NativeLegacyAtomicInt64: @unchecked Sendable {
+    private var storage: Int64
+
+    init(_ initialValue: Int64) {
+        storage = initialValue
+    }
+
+    func load() -> Int64 {
+        OSAtomicAdd64Barrier(0, &storage)
+    }
+
+    func store(_ value: Int64) {
+        while true {
+            let current = load()
+            if OSAtomicCompareAndSwap64Barrier(current, value, &storage) { return }
+        }
+    }
+}
+
+/// Timing accompanies an in-memory live frame only. It is never persisted in
+/// `PitchFrame` or a practice-session record, so UI gates can compare a real
+/// capture interval with an audible metronome window without changing data
+/// schemas or analytics semantics.
+struct NativeTimedPitchFrame: Equatable, Sendable {
+    let frame: PitchFrame
+    let captureStartHostTime: UInt64
+    let captureEndHostTime: UInt64
+}
+
+/// Lock-free single-producer/single-consumer handoff for AVAudioEngine's
+/// render tap. All PCM slots and the polling consumer are created before the
+/// tap starts. Release/acquire atomics publish a fully copied slot; the tap
+/// only copies into a free preallocated slot and advances one atomic index.
+final class NativeLiveCapturePipeline: @unchecked Sendable {
+    struct FinishResult {
+        let recording: NativeAudioFileWriter.FinishResult?
+        let frames: [PitchFrame]
+        let droppedInputFrameCount: Int
+    }
+
+    private final class Slot: @unchecked Sendable {
+        let buffer: AVAudioPCMBuffer
+        let timestampMs = NativeLegacyAtomicInt32(0)
+        let captureStartHostTime = NativeLegacyAtomicInt64(0)
+        let captureEndHostTime = NativeLegacyAtomicInt64(0)
+
+        init?(format: AVAudioFormat, frameCapacity: AVAudioFrameCount) {
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCapacity) else {
+                return nil
+            }
+            self.buffer = buffer
+        }
+    }
+
+    private let slots: [Slot]
+    private let producerIndex = NativeLegacyAtomicInt32(0)
+    private let consumerIndex = NativeLegacyAtomicInt32(0)
+    private let acceptingInput = NativeLegacyAtomicInt32(1)
+    private let droppedInputFrameCount = NativeLegacyAtomicInt32(0)
+    private let queue = DispatchQueue(label: "com.brasstune.native.live-capture-consumer", qos: .userInitiated)
+    private let timer: DispatchSourceTimer
+    // Accessed only on `queue` after initialization.  Starting/stopping an
+    // explicit tuner take is serialized through that same consumer queue, so
+    // it cannot race a render callback or accidentally include pre-take PCM.
+    private var writer: NativeAudioFileWriter?
+    private let format: AVAudioFormat
+    private let instrumentId: String
+    private let referencePitchHz: Double
+    private let receiveFrame: @Sendable (PitchFrame) -> Void
+    private let receiveTimedFrame: (@Sendable (NativeTimedPitchFrame) -> Void)?
+    private var drainedFrames: [PitchFrame] = []
+    private var takeFrames: [PitchFrame] = []
+    private let passiveFrameCapacity = 18_000
+    // Pitch detector frames are emitted roughly every 110 ms. Match the CAF
+    // five-minute quota so a long explicit take cannot grow metadata forever.
+    private let takeFrameCapacity: Int
+
+    init?(
+        format: AVAudioFormat,
+        // AVAudioEngine can deliver an oversized first slice after a route or
+        // input/output graph handoff even when the requested tap size is 4096.
+        // Preallocating 8192-frame slots keeps that physical-device callback
+        // on the bounded copy path instead of falsely reporting an overflow.
+        frameCapacity: AVAudioFrameCount = 8192,
+        slotCount: Int = 4,
+        writer: NativeAudioFileWriter?,
+        instrumentId: String,
+        referencePitchHz: Double,
+        automaticallyDrain: Bool = true,
+        receiveFrame: @escaping @Sendable (PitchFrame) -> Void,
+        receiveTimedFrame: (@Sendable (NativeTimedPitchFrame) -> Void)? = nil
+    ) {
+        guard slotCount >= 2 else { return nil }
+        var preparedSlots: [Slot] = []
+        preparedSlots.reserveCapacity(slotCount)
+        for _ in 0..<slotCount {
+            guard let slot = Slot(format: format, frameCapacity: frameCapacity) else { return nil }
+            preparedSlots.append(slot)
+        }
+        slots = preparedSlots
+        self.writer = writer
+        self.format = format
+        self.instrumentId = instrumentId
+        self.referencePitchHz = referencePitchHz
+        self.receiveFrame = receiveFrame
+        self.receiveTimedFrame = receiveTimedFrame
+        // The live tap requests 4,096 PCM frames. Keep a complete five-minute
+        // analytics window at the highest normal device rate, with room for
+        // one oversized route-handoff slice.
+        takeFrameCapacity = max(
+            1,
+            Int(ceil(NativeRecordingRetentionQuota.shipping.maximumDuration * format.sampleRate / 4_096)) + 16
+        )
+        timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.setEventHandler { [weak self] in self?.drain() }
+        timer.schedule(
+            deadline: automaticallyDrain ? .now() : .distantFuture,
+            repeating: .milliseconds(5),
+            leeway: .milliseconds(2)
+        )
+        timer.resume()
+    }
+
+    /// The only live-tap entrypoint. It contains no app lock, allocation,
+    /// asynchronous closure creation, file work, clock call, or UI publish.
+    func enqueueFromRenderTap(
+        _ buffer: AVAudioPCMBuffer,
+        timestampMs: Int,
+        captureStartHostTime: UInt64 = 0,
+        captureEndHostTime: UInt64 = 0
+    ) {
+        guard acceptingInput.load() == 1 else { return }
+        let producer = Int(producerIndex.load())
+        let next = (producer + 1) % slots.count
+        guard next != Int(consumerIndex.load()) else {
+            droppedInputFrameCount.increment()
+            return
+        }
+        let slot = slots[producer]
+        guard Self.copy(buffer, into: slot.buffer) else {
+            droppedInputFrameCount.increment()
+            return
+        }
+        slot.timestampMs.store(Int32(clamping: timestampMs))
+        slot.captureStartHostTime.store(Int64(bitPattern: captureStartHostTime))
+        slot.captureEndHostTime.store(Int64(bitPattern: captureEndHostTime))
+        producerIndex.store(Int32(next))
+    }
+
+    func finish() -> FinishResult {
+        acceptingInput.store(0)
+        let frames = queue.sync { () -> [PitchFrame] in
+            drain()
+            return drainedFrames
+        }
+        timer.cancel()
+        let droppedFrames = Int(droppedInputFrameCount.load())
+        if droppedFrames > 0 {
+            writer?.failClosedFromConsumer()
+        }
+        return FinishResult(
+            recording: writer?.finish(),
+            frames: frames,
+            droppedInputFrameCount: droppedFrames
+        )
+    }
+
+    struct DiscardResult: Equatable {
+        let droppedInputFrameCount: Int
+    }
+
+    func discard() -> DiscardResult {
+        acceptingInput.store(0)
+        queue.sync {
+            drain()
+            drainedFrames.removeAll(keepingCapacity: false)
+        }
+        timer.cancel()
+        writer?.discard()
+        return DiscardResult(
+            droppedInputFrameCount: Int(droppedInputFrameCount.load())
+        )
+    }
+
+    /// Starts writing only future consumer buffers.  `queue.sync` forms the
+    /// audio boundary: buffers already queued are drained before the writer is
+    /// installed, while every later buffer is written exactly once.
+    func beginRecording(destinationURL: URL) throws -> Int {
+        try queue.sync {
+            guard writer == nil else { throw NativeAudioEngineError.inputTapAlreadyInstalled }
+            drain()
+            writer = try NativeAudioFileWriter(destinationURL: destinationURL, inputFormat: format)
+            takeFrames.removeAll(keepingCapacity: true)
+            return Int(droppedInputFrameCount.load())
+        }
+    }
+
+    /// Finishes one explicit tuner take without ending the live listener or
+    /// removing its input tap.  A later take can install a fresh writer.
+    func finishRecording() -> NativeCaptureTakeFinishResult? {
+        queue.sync {
+            drain()
+            let result = writer?.finish()
+            writer = nil
+            guard let result else { return nil }
+            defer { takeFrames.removeAll(keepingCapacity: false) }
+            return NativeCaptureTakeFinishResult(
+                recording: result,
+                frames: takeFrames,
+                droppedInputFrameCount: Int(droppedInputFrameCount.load())
+            )
+        }
+    }
+
+    func discardRecording() {
+        queue.sync {
+            writer?.discard()
+            writer = nil
+            takeFrames.removeAll(keepingCapacity: false)
+        }
+    }
+
+    private func drain() {
+        while true {
+            let consumer = Int(consumerIndex.load())
+            guard consumer != Int(producerIndex.load()) else { return }
+            let slot = slots[consumer]
+            writer?.writeFromConsumer(slot.buffer)
+            let frame = NativePitchDetector.frame(
+                from: slot.buffer,
+                timestampMs: Int(slot.timestampMs.load()),
+                instrumentId: instrumentId,
+                referencePitchHz: referencePitchHz
+            )
+            drainedFrames.append(frame)
+            if drainedFrames.count > passiveFrameCapacity {
+                drainedFrames.removeFirst(drainedFrames.count - passiveFrameCapacity)
+            }
+            if writer != nil {
+                takeFrames.append(frame)
+                if takeFrames.count > takeFrameCapacity {
+                    takeFrames.removeFirst(takeFrames.count - takeFrameCapacity)
+                }
+            }
+            let captureStartHostTime = UInt64(bitPattern: slot.captureStartHostTime.load())
+            let captureEndHostTime = UInt64(bitPattern: slot.captureEndHostTime.load())
+            if captureEndHostTime > captureStartHostTime {
+                receiveTimedFrame?(
+                    NativeTimedPitchFrame(
+                        frame: frame,
+                        captureStartHostTime: captureStartHostTime,
+                        captureEndHostTime: captureEndHostTime
+                    )
+                )
+            }
+            receiveFrame(frame)
+            consumerIndex.store(Int32((consumer + 1) % slots.count))
+        }
+    }
+
+    private static func copy(_ source: AVAudioPCMBuffer, into destination: AVAudioPCMBuffer) -> Bool {
+        guard source.frameLength <= destination.frameCapacity else { return false }
+        destination.frameLength = source.frameLength
+        let sourceList = UnsafeMutableAudioBufferListPointer(source.mutableAudioBufferList)
+        let destinationList = UnsafeMutableAudioBufferListPointer(destination.mutableAudioBufferList)
+        guard sourceList.count == destinationList.count else { return false }
+        for index in sourceList.indices {
+            guard let sourceData = sourceList[index].mData,
+                  let destinationData = destinationList[index].mData else { return false }
+            memcpy(destinationData, sourceData, Int(min(sourceList[index].mDataByteSize, destinationList[index].mDataByteSize)))
+        }
+        return true
+    }
+}
+
+/// Converts a MainActor frame consumer into a genuinely nonisolated Sendable
+/// callback. The audio consumer queue invokes only the outer closure; the
+/// receiver itself is entered after Swift has hopped to MainActor.
+enum NativeAudioFrameDelivery {
+    nonisolated static func toMainActor(
+        _ receiver: @escaping @MainActor @Sendable (PitchFrame) -> Void
+    ) -> @Sendable (PitchFrame) -> Void {
+        { frame in
+            Task { @MainActor in
+                receiver(frame)
+            }
+        }
+    }
+
+    nonisolated static func timedFrameToMainActor(
+        _ receiver: @escaping @MainActor @Sendable (NativeTimedPitchFrame) -> Void
+    ) -> @Sendable (NativeTimedPitchFrame) -> Void {
+        { timedFrame in
+            Task { @MainActor in
+                receiver(timedFrame)
+            }
+        }
+    }
+}
+
+struct NativeRecordingPlaybackDriver {
+    let duration: () -> TimeInterval
+    let currentTime: () -> TimeInterval
+    let setCurrentTime: (TimeInterval) -> Void
+    let isPlaying: () -> Bool
+    let prepareToPlay: () -> Bool
+    let play: () -> Bool
+    let pause: () -> Void
+    let stop: () -> Void
+
+    static func live(url: URL) throws -> NativeRecordingPlaybackDriver {
+        let player = try AVAudioPlayer(contentsOf: url)
+        return NativeRecordingPlaybackDriver(
+            duration: { player.duration },
+            currentTime: { player.currentTime },
+            setCurrentTime: { player.currentTime = $0 },
+            isPlaying: { player.isPlaying },
+            prepareToPlay: { player.prepareToPlay() },
+            play: { player.play() },
+            pause: { player.pause() },
+            stop: { player.stop() }
+        )
+    }
+}
+
+@MainActor
+final class NativeRecordingPlayer: ObservableObject {
+    enum State: Equatable {
+        case stopped
+        case playing
+        case paused
+    }
+
+    @Published private(set) var state: State = .stopped
+    @Published private(set) var loadedURL: URL?
+    @Published private(set) var currentTime: TimeInterval = 0
+    @Published private(set) var duration: TimeInterval = 0
+    @Published private(set) var notice: String?
+
+    private let audioSessionCoordinator: NativeAudioSessionCoordinator
+    private let makeDriver: (URL) throws -> NativeRecordingPlaybackDriver
+    private var driver: NativeRecordingPlaybackDriver?
+    private var progressTimer: Timer?
+    private var playbackGeneration: UInt64 = 0
+    nonisolated(unsafe) private var routeChangeObserver: NSObjectProtocol?
+    nonisolated(unsafe) private var interruptionObserver: NSObjectProtocol?
+    nonisolated(unsafe) private var mediaServicesResetObserver: NSObjectProtocol?
+    private var prepareForPlayback: (() -> Void)?
+
+    init(
+        audioSessionCoordinator: NativeAudioSessionCoordinator = .shared,
+        makeDriver: @escaping (URL) throws -> NativeRecordingPlaybackDriver = NativeRecordingPlaybackDriver.live
+    ) {
+        self.audioSessionCoordinator = audioSessionCoordinator
+        self.makeDriver = makeDriver
+        routeChangeObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            let rawReason = notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt
+            Task { @MainActor in
+                self?.handleRouteChange(rawReason: rawReason)
+            }
+        }
+        interruptionObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.interruptionNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            let rawType = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
+            Task { @MainActor in
+                self?.handleInterruption(rawType: rawType)
+            }
+        }
+        mediaServicesResetObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.mediaServicesWereResetNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.handleMediaServicesReset()
+            }
+        }
+    }
+
+    deinit {
+        if let routeChangeObserver {
+            NotificationCenter.default.removeObserver(routeChangeObserver)
+        }
+        if let interruptionObserver {
+            NotificationCenter.default.removeObserver(interruptionObserver)
+        }
+        if let mediaServicesResetObserver {
+            NotificationCenter.default.removeObserver(mediaServicesResetObserver)
+        }
+    }
+
+    func setPlaybackPreparation(_ preparation: @escaping () -> Void) {
+        prepareForPlayback = preparation
+    }
+
+    func togglePlayback(url: URL) {
+        if loadedURL == url, state == .playing {
+            pause()
+        } else {
+            play(url: url)
+        }
+    }
+
+    func play(url: URL) {
+        notice = nil
+        if loadedURL != url {
+            stopAndUnload()
+            do {
+                driver = try makeDriver(url)
+                loadedURL = url
+                duration = max(0, driver?.duration() ?? 0)
+            } catch {
+                notice = NativeLocalization.string("This recording is no longer on this device.")
+                return
+            }
+        }
+
+        prepareForPlayback?()
+        guard !audioSessionCoordinator.isActive(.capture) else {
+            notice = NativeLocalization.string("Stop and save recording")
+            return
+        }
+
+        playbackGeneration &+= 1
+        let generation = playbackGeneration
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                _ = try await self.audioSessionCoordinator.acquire(
+                    .recordingPlayback,
+                    configuration: .recordingPlayback
+                )
+            } catch {
+                guard generation == self.playbackGeneration else { return }
+                self.notice = Self.recordingPlaybackFailureNotice()
+                return
+            }
+            // A newer play request may be awaiting the same coalesced physical
+            // session readiness. The stale waiter must not release that newer
+            // request's shared owner after activation completes.
+            guard generation == self.playbackGeneration else { return }
+            guard let driver = self.driver else {
+                self.audioSessionCoordinator.release(.recordingPlayback, deactivation: .immediate)
+                return
+            }
+            _ = driver.prepareToPlay()
+            guard driver.play() else {
+                self.audioSessionCoordinator.release(.recordingPlayback, deactivation: .immediate)
+                self.notice = Self.recordingPlaybackFailureNotice()
+                return
+            }
+            self.state = .playing
+            self.currentTime = driver.currentTime()
+            self.scheduleProgressTimer()
+        }
+    }
+
+    private static func recordingPlaybackFailureNotice() -> String {
+        NativeLocalization.string(
+            "BrassTune couldn't play this recording. Check your audio output and try again."
+        )
+    }
+
+    func pause() {
+        guard state == .playing, let driver else { return }
+        playbackGeneration &+= 1
+        driver.pause()
+        currentTime = driver.currentTime()
+        state = .paused
+        invalidateProgressTimer()
+        audioSessionCoordinator.release(.recordingPlayback)
+    }
+
+    func stop() {
+        playbackGeneration &+= 1
+        driver?.stop()
+        driver?.setCurrentTime(0)
+        currentTime = 0
+        state = .stopped
+        invalidateProgressTimer()
+        audioSessionCoordinator.release(.recordingPlayback)
+    }
+
+    func stopAndUnload() {
+        stop()
+        driver = nil
+        loadedURL = nil
+        duration = 0
+        notice = nil
+    }
+
+    func handleRouteChange(rawReason: UInt?) {
+        guard Self.isOutputLossRouteChange(rawReason: rawReason),
+              state == .playing || state == .paused else { return }
+        stop()
+        audioSessionCoordinator.deactivateImmediatelyIfIdle()
+        notice = NativeLocalization.string("Your audio output changed. Check your headphones or speaker before continuing.")
+    }
+
+    func handleInterruption(rawType: UInt?) {
+        guard rawType == AVAudioSession.InterruptionType.began.rawValue,
+              state == .playing else { return }
+        pause()
+        audioSessionCoordinator.deactivateImmediatelyIfIdle()
+        notice = NativeLocalization.string("Try again when you're ready.")
+    }
+
+    func handleMediaServicesReset() {
+        playbackGeneration &+= 1
+        let hadActivePlayback = state != .stopped || audioSessionCoordinator.isActive(.recordingPlayback)
+        driver?.stop()
+        driver?.setCurrentTime(0)
+        driver = nil
+        loadedURL = nil
+        currentTime = 0
+        duration = 0
+        state = .stopped
+        invalidateProgressTimer()
+        // This must happen before release: media services may already have
+        // discarded the underlying session, even if a prior deactivation
+        // attempt failed. A later explicit play must configure and activate.
+        audioSessionCoordinator.invalidateAfterMediaServicesReset()
+        audioSessionCoordinator.release(.recordingPlayback, deactivation: .immediate)
+        if hadActivePlayback {
+            notice = NativeLocalization.string("Audio services restarted. Try the audio action again.")
+        }
+    }
+
+    static func isOutputLossRouteChange(rawReason: UInt?) -> Bool {
+        rawReason == AVAudioSession.RouteChangeReason.oldDeviceUnavailable.rawValue
+            || rawReason == AVAudioSession.RouteChangeReason.noSuitableRouteForCategory.rawValue
+    }
+
+    private func scheduleProgressTimer() {
+        invalidateProgressTimer()
+        progressTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, let driver = self.driver else { return }
+                self.currentTime = driver.currentTime()
+                if !driver.isPlaying(), self.currentTime >= max(0, self.duration - 0.05) {
+                    self.stop()
+                }
+            }
+        }
+    }
+
+    private func invalidateProgressTimer() {
+        progressTimer?.invalidate()
+        progressTimer = nil
+    }
+}
+
+enum NativeAudioActivityState: Equatable {
+    case idle
+    case starting
+    case listeningNoSignal
+    case estimating
+    case stable
+    case interrupted
+    case routeChanged
+    case recoverableError
+    case fatalError
+}
+
+/// The single externally observable microphone contract. `permissionGranted`
+/// carries the live operational phase so callers cannot mistake a grant for an
+/// active, healthy audio capture.
+enum NativeAudioOperationalState: Equatable {
+    case permissionNotDetermined
+    case permissionRequesting
+    case permissionGranted(NativeAudioActivityState)
+    case permissionDenied
+    case permissionRestrictedOrUnavailable
+}
+
+/// Legacy deterministic buffer cache retained for isolated buffer tests. The
+/// production drone uses `NativeToneRenderState`, not this looping cache.
+struct NativeToneBufferCacheKey: Hashable {
+    let frequencyBitPatterns: [UInt64]
+
+    init(frequenciesHz: [Double]) {
+        frequencyBitPatterns = frequenciesHz.map(\.bitPattern)
+    }
+}
+
+/// A continuous oscillator bank for the production drone. Unlike a looping
+/// buffer, each oscillator advances its exact requested phase increment at
+/// render time, so equal-tempered frequencies have no loop seam or period
+/// quantization. Configuration happens while the engine is stopped; the
+/// render callback then only reads and advances these fixed arrays.
+final class NativeToneRenderState: @unchecked Sendable {
+    private var phases: [Double] = []
+    private var phaseIncrements: [Double] = []
+    private var gain: Float = 0
+
+    static func format() throws -> AVAudioFormat {
+        guard let format = AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 1) else {
+            throw NativeAudioEngineError.outputUnavailable
+        }
+        return format
+    }
+
+    func configure(frequenciesHz: [Double], volume: Double, sampleRate: Double) {
+        phases = Array(repeating: 0, count: frequenciesHz.count)
+        phaseIncrements = frequenciesHz.map { 2 * Double.pi * $0 / sampleRate }
+        gain = Float(volume / Double(max(1, frequenciesHz.count)))
+    }
+
+    static func effectiveFrequency(frequencyHz: Double, sampleRate: Double) -> Double {
+        let phaseIncrement = 2 * Double.pi * frequencyHz / sampleRate
+        return phaseIncrement * sampleRate / (2 * Double.pi)
+    }
+
+    func stop() {
+        gain = 0
+        phases.removeAll(keepingCapacity: true)
+        phaseIncrements.removeAll(keepingCapacity: true)
+    }
+
+    func render(
+        frameCount: AVAudioFrameCount,
+        audioBufferList: UnsafeMutablePointer<AudioBufferList>
+    ) -> OSStatus {
+        let buffers = UnsafeMutableAudioBufferListPointer(audioBufferList)
+        guard !phaseIncrements.isEmpty else {
+            for buffer in buffers {
+                if let data = buffer.mData { memset(data, 0, Int(buffer.mDataByteSize)) }
+            }
+            return noErr
+        }
+        for frame in 0..<Int(frameCount) {
+            var value = 0.0
+            for index in phases.indices {
+                value += sin(phases[index])
+                phases[index] += phaseIncrements[index]
+                if phases[index] >= 2 * Double.pi { phases[index] -= 2 * Double.pi }
+            }
+            let sample = Float(value) * gain
+            for buffer in buffers {
+                guard let data = buffer.mData else { continue }
+                data.assumingMemoryBound(to: Float.self)[frame] = sample
+            }
+        }
+        return noErr
+    }
+}
+
+final class NativeToneBufferCache {
+    private let capacity: Int
+    private var buffers: [NativeToneBufferCacheKey: AVAudioPCMBuffer] = [:]
+    private var recency: [NativeToneBufferCacheKey] = []
+
+    init(capacity: Int = 8) {
+        self.capacity = max(1, capacity)
+    }
+
+    func buffer(for frequenciesHz: [Double]) throws -> AVAudioPCMBuffer {
+        let key = NativeToneBufferCacheKey(frequenciesHz: frequenciesHz)
+        if let cached = buffers[key] {
+            touch(key)
+            return cached
+        }
+
+        let loopSeconds = 1.0
+        let frameCount: AVAudioFrameCount = 44_100
+        guard let format = AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 1),
+              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount),
+              let samples = buffer.floatChannelData?[0] else {
+            throw NativeAudioEngineError.outputUnavailable
+        }
+        buffer.frameLength = frameCount
+        let normalization = 1 / Float(frequenciesHz.count)
+        let wholeCycleCounts = frequenciesHz.map { max(1, Int(($0 * loopSeconds).rounded())) }
+        for frame in 0..<Int(buffer.frameLength) {
+            let sample = wholeCycleCounts.reduce(0.0) { partial, cycles in
+                let phase = 2 * Double.pi * Double(cycles) * Double(frame) / Double(buffer.frameLength)
+                return partial + sin(phase)
+            }
+            // The source is looped, so each frame must retain its steady-state
+            // amplitude. The player volume is bounded to <= 0.5 by
+            // `startTone`, keeping the summed dyad peak below the graph peak.
+            samples[frame] = Float(sample) * normalization
+        }
+
+        buffers[key] = buffer
+        touch(key)
+        while recency.count > capacity {
+            buffers.removeValue(forKey: recency.removeFirst())
+        }
+        return buffer
+    }
+
+    var count: Int { buffers.count }
+
+    static func loopSeamSlopeError(samples: [Float]) -> Float {
+        guard samples.count >= 3 else { return 0 }
+        let bodySlope = samples[1] - samples[0]
+        let seamSlope = samples[0] - samples[samples.count - 1]
+        return abs(seamSlope - bodySlope)
+    }
+
+    private func touch(_ key: NativeToneBufferCacheKey) {
+        recency.removeAll { $0 == key }
+        recency.append(key)
+    }
+}
+
+@MainActor
+final class NativeAudioEngine: ObservableObject {
+    @Published private(set) var recording = false
+    /// Capture/listening is intentionally distinct from a saved take. The
+    /// tuner may remain live indefinitely without creating a session.
+    @Published private(set) var listening = false
+    @Published private(set) var takeRecording = false
+    @Published private(set) var permissionDenied = false
+    @Published private(set) var currentFrame: PitchFrame?
+    /// Render-tap timing for the current live frame. This remains separate
+    /// from persisted `PitchFrame` data so callers can reject frames whose
+    /// real capture interval overlaps an audible output window.
+    @Published private(set) var currentTimedFrame: NativeTimedPitchFrame?
+    @Published private(set) var frames: [PitchFrame] = []
+    /// Number of live microphone frames accepted by the UI-side receiver for
+    /// the active capture. Unlike `frames`, this diagnostic survives a
+    /// deliberate discard so physical instrumentation can prove the capture
+    /// had an input-delivery denominator without retaining pitch data.
+    @Published private(set) var acceptedLiveFrameCount = 0
+    @Published private(set) var activeSource: PracticeSessionSource = .live
+    @Published private(set) var audioNotice: String?
+    @Published private(set) var routeChanged = false
+    @Published private(set) var audioState: NativeAudioOperationalState = .permissionNotDetermined
+    @Published private(set) var tonePlaying = false
+    @Published private(set) var toneFrequencyHz: Double?
+    @Published private(set) var toneFrequenciesHz: [Double] = []
+    /// Intent is separate from the last completed UI value. During A→B→A,
+    /// the UI may still truthfully show completed A while the control-plane
+    /// queue is committed to B; comparing against this value ensures the
+    /// final A is enqueued as a corrective retune rather than treated as a
+    /// volume-only no-op.
+    private var requestedToneFrequenciesHz: [Double] = []
+    private var toneTransitionGeneration: UInt64 = 0
+
+    private(set) var audioGraphGeneration: UInt64 = 0
+    private var fixtureStartedAt: Date?
+    private var fixtureInstrumentId = "trumpet"
+    private var fixtureReferencePitchHz = 440.0
+    private var liveStartRequestID: UUID?
+    private var activeCaptureID: UUID?
+    /// Deliberately independent from the bounded live display ring.  A long
+    /// passive tuner session cannot move an explicit take's boundary.
+    private var takeStartAcceptedFrameCount = 0
+    private var takeDroppedInputFrameBaseline = 0
+    private var takeStartedAt: Date?
+    private var fixtureTakeStartFrameIndex = 0
+    private var requestGeneration: UInt64 = 0
+    private let maxLiveFrames = 18_000
+    nonisolated(unsafe) private var routeChangeObserver: NSObjectProtocol?
+    nonisolated(unsafe) private var interruptionObserver: NSObjectProtocol?
+    nonisolated(unsafe) private var mediaServicesResetObserver: NSObjectProtocol?
+    private let audioSessionCoordinator: NativeAudioSessionCoordinator
+    private let microphonePermissionRequester: @MainActor () async -> Bool
+    private let simulateTonePlayback: Bool
+    private var prepareForTonePlayback: (() -> Void)?
+    private var unexpectedCaptureCompletion: ((NativeLiveCapture) -> Void)?
+
+    static var defaultRecordingSource: PracticeSessionSource {
+        NativeTestFixtures.areEnabled() ? .sample : .live
+    }
+
+    static var testFixturesEnabled: Bool { NativeTestFixtures.areEnabled() }
+
+    init(
+        audioSessionCoordinator: NativeAudioSessionCoordinator = .shared,
+        microphonePermissionRequester: (@MainActor () async -> Bool)? = nil,
+        simulateTonePlayback: Bool = false
+    ) {
+        self.audioSessionCoordinator = audioSessionCoordinator
+        self.microphonePermissionRequester = microphonePermissionRequester ?? {
+            await AVAudioApplication.requestRecordPermission()
+        }
+        self.simulateTonePlayback = simulateTonePlayback
+        routeChangeObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            let rawReason = notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt
+            Task { @MainActor in
+                self?.handleRouteChange(rawReason: rawReason)
+            }
+        }
+        interruptionObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.interruptionNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            let typeValue = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
+            Task { @MainActor in
+                self?.handleInterruption(rawType: typeValue)
+            }
+        }
+        mediaServicesResetObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.mediaServicesWereResetNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.handleMediaServicesReset()
+            }
+        }
+        if Self.testFixturesEnabled,
+           ProcessInfo.processInfo.arguments.contains("UITEST_MIC_DENIED") {
+            setAudioState(.permissionDenied)
+        }
+    }
+
+    deinit {
+        if let routeChangeObserver {
+            NotificationCenter.default.removeObserver(routeChangeObserver)
+        }
+        if let interruptionObserver {
+            NotificationCenter.default.removeObserver(interruptionObserver)
+        }
+        if let mediaServicesResetObserver {
+            NotificationCenter.default.removeObserver(mediaServicesResetObserver)
+        }
+    }
+
+    func requestMicrophonePermission() async -> Bool {
+        setAudioState(.permissionRequesting)
+        let granted = await microphonePermissionRequester()
+        guard audioState == .permissionRequesting else { return granted }
+        setAudioState(granted ? .permissionGranted(.idle) : .permissionDenied)
+        return granted
+    }
+
+    func startFixtureRecording(instrumentId: String, referencePitchHz: Double) {
+        guard Self.testFixturesEnabled else {
+            stopAndResetAudioEngine()
+            activeSource = .live
+            frames.removeAll()
+            currentFrame = nil
+            currentTimedFrame = nil
+            return
+        }
+        stopAndResetAudioEngine()
+        recording = true
+        listening = true
+        takeRecording = true
+        takeStartAcceptedFrameCount = 0
+        takeStartedAt = fixtureStartedAt
+        activeSource = .sample
+        fixtureStartedAt = Date()
+        fixtureInstrumentId = instrumentId
+        fixtureReferencePitchHz = NativeReferencePitch.sanitized(referencePitchHz)
+        frames = (0..<12).map { PitchFrame.fixture(index: $0, instrumentId: instrumentId, referencePitchHz: fixtureReferencePitchHz) }
+        currentFrame = frames.last
+        currentTimedFrame = nil
+        setAudioState(.permissionGranted(
+            currentFrame.map(Self.isStableTunerFrame) == true ? .stable : .estimating
+        ))
+    }
+
+    func stopFixtureRecording() -> [PitchFrame] {
+        guard Self.testFixturesEnabled, activeSource == .sample else {
+            stopAndResetAudioEngine()
+            frames.removeAll()
+            currentFrame = nil
+            currentTimedFrame = nil
+            return []
+        }
+        let elapsed = max(3.5, Date().timeIntervalSince(fixtureStartedAt ?? Date()))
+        let frameCount = min(240, max(12, Int((elapsed / 0.11).rounded())))
+        frames = (0..<frameCount).map { PitchFrame.fixture(index: $0, instrumentId: fixtureInstrumentId, referencePitchHz: fixtureReferencePitchHz) }
+        currentFrame = frames.last
+        recording = false
+        listening = false
+        takeRecording = false
+        takeStartedAt = nil
+        fixtureStartedAt = nil
+        setAudioState(.permissionGranted(.idle))
+        return frames
+    }
+
+    func startLiveRecording(
+        instrumentId: String,
+        referencePitchHz: Double,
+        recordingURL: URL? = nil,
+        audibleMetronome: Bool = false
+    ) async throws -> Bool {
+        // Multiple UI actions can arrive while permission is being resolved.
+        // Never install a second tap or race the first request's cleanup.
+        if recording, activeSource == .live { return true }
+        guard liveStartRequestID == nil else { return false }
+        guard !audioSessionCoordinator.isActive(.capture) else { return false }
+        // UI fixtures must still honor an explicitly injected denied state;
+        // only successful fixture captures synthesize tuner frames.
+        if Self.testFixturesEnabled, audioState == .permissionDenied {
+            recording = false
+            listening = false
+            activeSource = .live
+            return false
+        }
+        if Self.testFixturesEnabled {
+            // Simulate a live capture so the tuner's recording UI is drivable in
+            // UI tests without a physical microphone. activeSource stays .live so
+            // it behaves like a real live take (no sample-mode surface).
+            stopAndResetAudioEngine()
+            recording = true
+            listening = true
+            takeRecording = recordingURL != nil
+            fixtureTakeStartFrameIndex = takeRecording ? frames.count : 0
+            takeStartAcceptedFrameCount = 0
+            takeStartedAt = takeRecording ? Date() : nil
+            activeSource = .live
+            let safeReferencePitch = NativeReferencePitch.sanitized(referencePitchHz)
+            frames = (0..<12).map { PitchFrame.fixture(index: $0, instrumentId: instrumentId, referencePitchHz: safeReferencePitch) }
+            currentFrame = frames.last
+            currentTimedFrame = nil
+            setAudioState(.permissionGranted(
+                currentFrame.map(Self.isStableTunerFrame) == true ? .stable : .estimating
+            ))
+            return true
+        }
+        let requestID = UUID()
+        liveStartRequestID = requestID
+        let permissionGranted = await requestMicrophonePermission()
+        guard liveStartRequestID == requestID else { return false }
+        liveStartRequestID = nil
+        guard permissionGranted else {
+            recording = false
+            activeSource = .live
+            frames.removeAll()
+            currentFrame = nil
+            currentTimedFrame = nil
+            return false
+        }
+        requestGeneration &+= 1
+        let generation = requestGeneration
+        let captureID = UUID()
+        activeCaptureID = captureID
+        frames.removeAll()
+        currentFrame = nil
+        currentTimedFrame = nil
+        acceptedLiveFrameCount = 0
+        activeSource = .live
+        takeStartAcceptedFrameCount = 0
+        takeStartedAt = recordingURL == nil ? nil : Date()
+        takeRecording = recordingURL != nil
+        setAudioState(.permissionGranted(.starting))
+        let request = NativeCaptureStartRequest(
+            generation: generation,
+            captureID: captureID,
+            instrumentId: instrumentId,
+            referencePitchHz: NativeReferencePitch.sanitized(referencePitchHz),
+            recordingURL: recordingURL,
+            audibleMetronome: audibleMetronome,
+            receiveFrame: Self.makeFrameReceiver(engine: self, captureID: captureID),
+            receiveTimedFrame: Self.makeTimedFrameReceiver(engine: self, captureID: captureID)
+        )
+        let physicalStart: Task<NativeCaptureStartResult, Error>
+        do {
+            physicalStart = try audioSessionCoordinator.startCapture(request)
+        } catch {
+            setAudioState(.permissionGranted(.recoverableError))
+            throw error
+        }
+        do {
+            let result = try await physicalStart.value
+            guard result.generation == requestGeneration,
+                  liveStartRequestID == nil else {
+                return false
+            }
+            audioGraphGeneration = result.graphGeneration
+            recording = true
+            listening = true
+            return true
+        } catch {
+            guard generation == requestGeneration else { return false }
+            audioSessionCoordinator.rollbackLogicalOwner(.capture)
+            recording = false
+            listening = false
+            takeRecording = false
+            if case NativeAudioEngineError.inputUnavailable = error {
+                setAudioState(.permissionRestrictedOrUnavailable)
+            } else {
+                setAudioState(.permissionGranted(.recoverableError))
+            }
+            throw error
+        }
+    }
+
+    func cancelPendingLiveStart() {
+        requestGeneration &+= 1
+        if !recording, audioSessionCoordinator.isActive(.capture) {
+            let generation = requestGeneration
+            activeCaptureID = nil
+            _ = audioSessionCoordinator.stopCapture(
+                generation: generation,
+                reason: .userStopped,
+                discard: true
+            )
+        }
+        if audioState == .permissionRequesting {
+            setAudioState(.permissionNotDetermined)
+        }
+        liveStartRequestID = nil
+    }
+
+    func setTonePlaybackPreparation(_ preparation: @escaping () -> Void) {
+        prepareForTonePlayback = preparation
+    }
+
+    func setUnexpectedCaptureCompletion(_ completion: @escaping (NativeLiveCapture) -> Void) {
+        unexpectedCaptureCompletion = completion
+    }
+
+    func stopLiveRecording() -> Task<NativeLiveCapture, Never> {
+        stopLiveCapture(reason: .userStopped, discard: false)
+    }
+
+    /// Starts a persisted take inside an already live tuner capture. This
+    /// never installs a second input tap. The capture consumer serializes the
+    /// writer boundary, while the frame boundary is monotonic rather than an
+    /// index into the 18k live display ring.
+    func beginLiveTake(recordingURL: URL) async -> Bool {
+        guard listening, recording, activeSource == .live, !takeRecording else { return false }
+        if !Self.testFixturesEnabled {
+            do {
+                takeDroppedInputFrameBaseline = try await audioSessionCoordinator.beginCaptureTake(recordingURL: recordingURL).value
+            } catch {
+                setAudioState(.permissionGranted(.recoverableError))
+                return false
+            }
+        }
+        takeStartAcceptedFrameCount = acceptedLiveFrameCount
+        takeStartedAt = Date()
+        fixtureTakeStartFrameIndex = frames.count
+        if Self.testFixturesEnabled {
+            let start = frames.count
+            let instrumentID = fixtureInstrumentId
+            let reference = fixtureReferencePitchHz
+            let postTakeFrames = (start..<(start + 12)).map {
+                PitchFrame.fixture(index: $0, instrumentId: instrumentID, referencePitchHz: reference)
+            }
+            frames.append(contentsOf: postTakeFrames)
+            currentFrame = postTakeFrames.last
+        }
+        takeRecording = true
+        return true
+    }
+
+    func finishLiveTake(
+        reason: NativeLiveCaptureCompletionReason = .userStopped
+    ) -> Task<NativeLiveCapture?, Never>? {
+        guard listening, recording, activeSource == .live, takeRecording else { return nil }
+        let startedAt = takeStartedAt ?? Date()
+        takeRecording = false
+        takeStartedAt = nil
+        let captureID = UUID()
+        if Self.testFixturesEnabled {
+            let fixtureTakeFrames = Array(frames.dropFirst(fixtureTakeStartFrameIndex))
+            // Fixture taps are instantaneous, but their deterministic frames
+            // model a real short take; keep production duration thresholds.
+            let fixtureEndedAt = max(Date(), startedAt.addingTimeInterval(2))
+            return Task {
+                NativeLiveCapture(
+                    id: captureID, startedAt: startedAt, endedAt: fixtureEndedAt, frames: fixtureTakeFrames.filter(\.isValidForRecording),
+                    recordingURL: nil, recordingRetentionFailure: nil, completionReason: reason
+                )
+            }
+        }
+        let physicalFinish = audioSessionCoordinator.finishCaptureTake()
+        // A new take may begin before this asynchronous consumer drain
+        // returns. Snapshot its own overflow baseline now, not in the task.
+        let droppedBaseline = takeDroppedInputFrameBaseline
+        return Task {
+            let result = await physicalFinish.value
+            return NativeLiveCapture(
+                id: captureID, startedAt: startedAt, endedAt: Date(),
+                frames: result?.frames.filter(\.isValidForRecording) ?? [],
+                droppedInputFrameCount: max(0, (result?.droppedInputFrameCount ?? 0) - droppedBaseline),
+                recordingURL: result?.recording?.recordingURL, recordingRetentionFailure: result?.recording?.retentionFailure,
+                completionReason: reason
+            )
+        }
+    }
+
+    @discardableResult
+    func discardLiveRecording() -> Task<NativeLiveCapture, Never> {
+        audioSessionCoordinator.discardCaptureTake()
+        let completion = stopLiveCapture(reason: .userStopped, discard: true)
+        frames.removeAll()
+        currentFrame = nil
+        currentTimedFrame = nil
+        return completion
+    }
+
+    func startTone(frequencyHz: Double, volume: Double) throws {
+        try startTone(frequenciesHz: [frequencyHz], volume: volume)
+    }
+
+    func startTone(frequenciesHz: [Double], volume: Double) throws {
+        guard (1...4).contains(frequenciesHz.count),
+              frequenciesHz.allSatisfy({ $0.isFinite && (20...5_000).contains($0) }) else {
+            throw NativeAudioEngineError.invalidToneFrequency
+        }
+        let safeVolume = Float(min(0.5, max(0.05, volume)))
+        // SwiftUI's Slider emits a start request for each intermediate value.
+        // The existing oscillator is already producing the same pitch, so
+        // preserve its phase and graph and only update its dedicated mixer.
+        // This also keeps the initial asynchronous start ahead of its later
+        // volume updates on the control-plane FIFO.
+        if tonePlaying, requestedToneFrequenciesHz == frequenciesHz {
+            audioSessionCoordinator.updateToneVolume(safeVolume)
+            return
+        }
+        if tonePlaying {
+            if Self.testFixturesEnabled || simulateTonePlayback {
+                toneFrequencyHz = frequenciesHz[0]
+                toneFrequenciesHz = frequenciesHz
+                requestedToneFrequenciesHz = frequenciesHz
+                return
+            }
+            // Keep the existing session and output graph alive. The control
+            // plane serializes this after a pending initial start, then
+            // crossfades the old and new oscillators instead of resetting
+            // phase at an audible gain discontinuity.
+            requestedToneFrequenciesHz = frequenciesHz
+            toneTransitionGeneration &+= 1
+            let transitionGeneration = toneTransitionGeneration
+            let transitionRequest = NativeToneStartRequest(
+                generation: requestGeneration,
+                frequenciesHz: frequenciesHz,
+                volume: safeVolume
+            )
+            let physicalTransition = try audioSessionCoordinator.transitionTone(transitionRequest)
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                do {
+                    let completedGeneration = try await physicalTransition.value
+                    guard completedGeneration == self.requestGeneration,
+                          transitionGeneration == self.toneTransitionGeneration,
+                          self.tonePlaying else { return }
+                    self.toneFrequencyHz = frequenciesHz[0]
+                    self.toneFrequenciesHz = frequenciesHz
+                } catch {
+                    // The old source remains connected unless the transition
+                    // completed, so keep the prior displayed pitch truthful.
+                    guard transitionGeneration == self.toneTransitionGeneration else { return }
+                    self.requestedToneFrequenciesHz = self.toneFrequenciesHz
+                    self.audioNotice = NativeLocalization.string(
+                        "BrassTune couldn't start the reference tone. Check your audio output and try again."
+                    )
+                }
+            }
+            return
+        }
+        prepareForTonePlayback?()
+        if recording {
+            guard !recording else {
+                throw NativeAudioEngineError.captureActive
+            }
+        }
+        let frequencyHz = frequenciesHz[0]
+        stopAndResetAudioEngine()
+        activeSource = .live
+        if Self.testFixturesEnabled || simulateTonePlayback {
+            tonePlaying = true
+            toneFrequencyHz = frequencyHz
+            toneFrequenciesHz = frequenciesHz
+            requestedToneFrequenciesHz = frequenciesHz
+            return
+        }
+        requestGeneration &+= 1
+        let generation = requestGeneration
+        let physicalStart = try audioSessionCoordinator.startTone(NativeToneStartRequest(
+            generation: generation,
+            frequenciesHz: frequenciesHz,
+            volume: safeVolume
+        ))
+        tonePlaying = true
+        toneFrequencyHz = frequencyHz
+        toneFrequenciesHz = frequenciesHz
+        requestedToneFrequenciesHz = frequenciesHz
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let completedGeneration = try await physicalStart.value
+                guard completedGeneration == self.requestGeneration,
+                      self.tonePlaying else {
+                    return
+                }
+                self.audioGraphGeneration = await self.audioSessionCoordinator.graphGeneration()
+            } catch {
+                guard generation == self.requestGeneration else { return }
+                self.audioSessionCoordinator.rollbackLogicalOwner(.tone)
+                self.tonePlaying = false
+                self.toneFrequencyHz = nil
+                self.toneFrequenciesHz = []
+                self.requestedToneFrequenciesHz = []
+                self.setAudioState(.permissionGranted(.recoverableError))
+            }
+        }
+    }
+
+    func stopTone(
+        deactivation: NativeAudioSessionCoordinator.DeactivationPolicy = .deferred
+    ) {
+        guard tonePlaying || audioSessionCoordinator.isActive(.tone) else { return }
+        requestGeneration &+= 1
+        tonePlaying = false
+        toneFrequencyHz = nil
+        toneFrequenciesHz = []
+        requestedToneFrequenciesHz = []
+        audioSessionCoordinator.stopTone(deactivation: deactivation)
+    }
+
+    func setExternalAudioNotice(_ message: String?) {
+        audioNotice = message
+    }
+
+    func stopAndResetAudioEngine() {
+        resetAudioEngine(discardCaptureFile: true)
+    }
+
+    /// Call after feature teardown when the app leaves the active scene. This
+    /// cancels any short handoff delay without disturbing an active owner.
+    func deactivateSessionImmediatelyIfIdle() {
+        audioSessionCoordinator.deactivateImmediatelyIfIdle()
+    }
+
+    func handleRouteChange(rawReason: UInt?) {
+        guard NativeRecordingPlayer.isOutputLossRouteChange(rawReason: rawReason) else {
+            // `.categoryChange` is emitted for BrassTune's own session
+            // reconfiguration. Treating it as output loss stops tones that just
+            // started and makes listen-back appear broken.
+            return
+        }
+        audioSessionCoordinator.invalidateSessionConfiguration()
+
+        let wasPlayingTone = tonePlaying
+        let wasCapturingLive = recording && activeSource == .live
+        if wasCapturingLive {
+            let explicitTake = takeRecording
+            let completion = explicitTake ? finishLiveTake(reason: .routeLoss) : nil
+            _ = stopLiveCapture(reason: .routeLoss, discard: true)
+            setAudioState(.permissionGranted(.routeChanged))
+            if let completion {
+                Task { @MainActor [weak self] in
+                    guard let self, let capture = await completion.value else { return }
+                    self.unexpectedCaptureCompletion?(capture)
+                }
+            }
+            return
+        } else if wasPlayingTone {
+            stopTone(deactivation: .immediate)
+            routeChanged = true
+            audioNotice = NativeLocalization.string("The reference tone stopped because your audio output changed. Check your headphones or speaker before restarting.")
+            return
+        }
+        if case .permissionGranted = audioState {
+            setAudioState(.permissionGranted(.routeChanged))
+        } else {
+            audioNotice = NativeLocalization.string("Your audio output changed. Check your headphones or speaker before continuing.")
+        }
+    }
+
+    func handleInterruption(rawType: UInt?) {
+        if rawType == AVAudioSession.InterruptionType.began.rawValue {
+            audioSessionCoordinator.invalidateSessionConfiguration()
+        }
+        if rawType == AVAudioSession.InterruptionType.began.rawValue,
+           recording, activeSource == .live {
+            let explicitTake = takeRecording
+            let completion = explicitTake ? finishLiveTake(reason: .interruption) : nil
+            _ = stopLiveCapture(reason: .interruption, discard: true)
+            setAudioState(.permissionGranted(.interrupted))
+            if let completion {
+                Task { @MainActor [weak self] in
+                    guard let self, let capture = await completion.value else { return }
+                    self.unexpectedCaptureCompletion?(capture)
+                }
+            }
+        } else if rawType == AVAudioSession.InterruptionType.began.rawValue, tonePlaying {
+            stopTone(deactivation: .immediate)
+            if case .permissionGranted = audioState {
+                setAudioState(.permissionGranted(.interrupted))
+            } else {
+                audioNotice = NativeLocalization.string("The reference tone stopped because audio was interrupted. Try again when the interruption ends.")
+            }
+        } else if rawType == AVAudioSession.InterruptionType.ended.rawValue,
+                  audioState == .permissionGranted(.interrupted) {
+            // Do not silently resume a microphone after a phone call. The
+            // next explicit start receives a newly validated route instead.
+            setAudioState(.permissionGranted(.idle))
+        }
+    }
+
+    func handleMediaServicesReset() {
+        requestGeneration &+= 1
+        let generation = requestGeneration
+        let wasCapturing = recording && activeSource == .live
+        let explicitTake = wasCapturing && takeRecording
+        // Finish an explicit take on the pipeline consumer before the reset
+        // tears down its listener. Passive listening is never a session.
+        let takeCompletion = explicitTake
+            ? finishLiveTake(reason: .interruption)
+            : nil
+        recording = false
+        listening = false
+        takeRecording = false
+        takeStartedAt = nil
+        currentTimedFrame = nil
+        if !explicitTake { audioSessionCoordinator.discardCaptureTake() }
+        tonePlaying = false
+        toneFrequencyHz = nil
+        toneFrequenciesHz = []
+        requestedToneFrequenciesHz = []
+        liveStartRequestID = nil
+        let completion = audioSessionCoordinator.handleMediaServicesReset(
+            generation: generation
+        )
+        Task { @MainActor [weak self] in
+            let captureResult = await completion.value
+            guard let self, generation == self.requestGeneration else { return }
+            self.audioGraphGeneration = await self.audioSessionCoordinator.graphGeneration()
+            // The reset's generic result contains listener history, not an
+            // explicit take. Never turn passive tuner listening into a saved
+            // practice session after a media-services reset.
+            _ = captureResult
+            if explicitTake,
+               let takeCompletion,
+               let take = await takeCompletion.value {
+                self.unexpectedCaptureCompletion?(take)
+            }
+        }
+        // AVAudioEngine nodes/taps are invalid after this notification. State
+        // is recoverable, but no automatic restart can safely assume a route.
+        if case .permissionGranted = audioState {
+            setAudioState(.permissionGranted(.recoverableError))
+        } else {
+            audioNotice = NativeLocalization.string("Audio services restarted. Try the audio action again.")
+        }
+    }
+
+    private func resetAudioEngine(discardCaptureFile: Bool, graphIsValid: Bool = true) {
+        requestGeneration &+= 1
+        let generation = requestGeneration
+        if audioSessionCoordinator.isActive(.capture) {
+            _ = audioSessionCoordinator.stopCapture(
+                generation: generation,
+                reason: .userStopped,
+                discard: discardCaptureFile,
+                graphIsValid: graphIsValid
+            )
+        }
+        audioSessionCoordinator.stopTone()
+        recording = false
+        listening = false
+        takeRecording = false
+        takeStartedAt = nil
+        audioSessionCoordinator.discardCaptureTake()
+        tonePlaying = false
+        toneFrequencyHz = nil
+        toneFrequenciesHz = []
+        requestedToneFrequenciesHz = []
+        fixtureStartedAt = nil
+        liveStartRequestID = nil
+        currentTimedFrame = nil
+        if case .permissionGranted = audioState {
+            setAudioState(.permissionGranted(.idle))
+        }
+    }
+
+    private func stopLiveCapture(
+        reason: NativeLiveCaptureCompletionReason,
+        discard: Bool
+    ) -> Task<NativeLiveCapture, Never> {
+        requestGeneration &+= 1
+        let generation = requestGeneration
+        let fallbackID = activeCaptureID ?? UUID()
+        // A deliberate discard must report lifecycle diagnostics (including
+        // dropped input frames) without returning or republishing either the
+        // render-pipeline frames or the UI's last accepted frame cache.
+        let fallbackFrames = discard ? [] : frames
+        activeCaptureID = nil
+        recording = false
+        listening = false
+        takeRecording = false
+        takeStartedAt = nil
+        currentTimedFrame = nil
+        audioSessionCoordinator.discardCaptureTake()
+        tonePlaying = false
+        toneFrequencyHz = nil
+        toneFrequenciesHz = []
+        requestedToneFrequenciesHz = []
+        fixtureStartedAt = nil
+        liveStartRequestID = nil
+        if reason == .userStopped {
+            setAudioState(.permissionGranted(.idle))
+        }
+        guard audioSessionCoordinator.isActive(.capture) else {
+            return Task {
+                NativeLiveCapture(
+                    id: fallbackID,
+                    startedAt: Date(),
+                    endedAt: Date(),
+                    frames: fallbackFrames,
+                    recordingURL: nil,
+                    recordingRetentionFailure: nil,
+                    completionReason: reason
+                )
+            }
+        }
+        let physicalStop = audioSessionCoordinator.stopCapture(
+            generation: generation,
+            reason: reason,
+            discard: discard
+        )
+        return Task { @MainActor [weak self] in
+            let result = await physicalStop.value
+            let capture = !discard && result.capture.frames.isEmpty && !fallbackFrames.isEmpty
+                ? NativeLiveCapture(
+                    id: result.capture.id,
+                    startedAt: result.capture.startedAt,
+                    endedAt: result.capture.endedAt,
+                    frames: fallbackFrames,
+                    droppedInputFrameCount: result.capture.droppedInputFrameCount,
+                    recordingURL: result.capture.recordingURL,
+                    recordingRetentionFailure: result.capture.recordingRetentionFailure,
+                    completionReason: result.capture.completionReason
+                )
+                : result.capture
+            if let self, result.generation == self.requestGeneration {
+                if discard {
+                    self.frames.removeAll()
+                    self.currentFrame = nil
+                    self.currentTimedFrame = nil
+                } else {
+                    self.frames = capture.frames
+                    self.currentFrame = capture.frames.last
+                    self.currentTimedFrame = nil
+                }
+            }
+            return capture
+        }
+    }
+
+    private func appendLiveFrame(_ frame: PitchFrame, captureID: UUID) {
+        guard recording,
+              activeSource == .live,
+              activeCaptureID == captureID else { return }
+        frames.append(frame)
+        acceptedLiveFrameCount &+= 1
+        if frames.count > maxLiveFrames {
+            frames.removeFirst(frames.count - maxLiveFrames)
+        }
+        currentFrame = frame
+        if frame.rms < BrassTuneCore.silenceRMSThreshold {
+            setAudioState(.permissionGranted(.listeningNoSignal))
+        } else if !Self.isStableTunerFrame(frame) {
+            setAudioState(.permissionGranted(.estimating))
+        } else {
+            setAudioState(.permissionGranted(.stable))
+        }
+    }
+
+    private func appendTimedLiveFrame(
+        _ timedFrame: NativeTimedPitchFrame,
+        captureID: UUID
+    ) {
+        guard recording,
+              activeSource == .live,
+              activeCaptureID == captureID else { return }
+        currentTimedFrame = timedFrame
+    }
+
+    /// Test-only hook for regression coverage of teardown behavior after an
+    /// accepted microphone frame. It has internal visibility only and is not
+    /// reachable from the app's release UI surface.
+    func seedAcceptedLiveFrameForTesting(_ frame: PitchFrame) {
+        guard let activeCaptureID else { return }
+        appendLiveFrame(frame, captureID: activeCaptureID)
+    }
+
+    private func setAudioState(_ state: NativeAudioOperationalState) {
+        audioState = state
+        permissionDenied = state == .permissionDenied || state == .permissionRestrictedOrUnavailable
+        routeChanged = state == .permissionGranted(.routeChanged)
+        switch state {
+        case .permissionDenied:
+            audioNotice = NativeLocalization.string("Microphone access is off. Allow it in Settings, then try again.")
+        case .permissionRestrictedOrUnavailable:
+            audioNotice = NativeLocalization.string("BrassTune can't hear a microphone.")
+        case .permissionGranted(.interrupted):
+            audioNotice = NativeLocalization.string("Recording stopped because the audio session was interrupted.")
+        case .permissionGranted(.routeChanged):
+            audioNotice = NativeLocalization.string("Your audio output changed. Check your headphones or speaker before continuing.")
+        case .permissionGranted(.recoverableError):
+            audioNotice = NativeLocalization.string("BrassTune couldn't start the microphone. Check your audio input and try again.")
+        case .permissionGranted(.fatalError):
+            audioNotice = NativeLocalization.string("BrassTune couldn't continue the microphone session.")
+        default:
+            audioNotice = nil
+        }
+    }
+
+    /// The consumer queue calls this nonisolated Sendable closure. Actor entry
+    /// happens only inside the task, so Swift never invokes a MainActor-inferred
+    /// closure on the audio consumer queue before it can hop actors.
+    nonisolated private static func makeFrameReceiver(
+        engine: NativeAudioEngine,
+        captureID: UUID
+    ) -> @Sendable (PitchFrame) -> Void {
+        NativeAudioFrameDelivery.toMainActor { [weak engine] frame in
+            engine?.appendLiveFrame(frame, captureID: captureID)
+        }
+    }
+
+    /// The consumer queue forwards immutable render-tap metadata; MainActor
+    /// only publishes it. This preserves the original capture host interval
+    /// rather than substituting a delayed UI-delivery timestamp.
+    nonisolated private static func makeTimedFrameReceiver(
+        engine: NativeAudioEngine,
+        captureID: UUID
+    ) -> @Sendable (NativeTimedPitchFrame) -> Void {
+        NativeAudioFrameDelivery.timedFrameToMainActor { [weak engine] timedFrame in
+            engine?.appendTimedLiveFrame(timedFrame, captureID: captureID)
+        }
+    }
+
+    nonisolated static func isStableTunerFrame(_ frame: PitchFrame) -> Bool {
+        frame.frequencyHz?.isFinite == true
+            && frame.centsDeviation?.isFinite == true
+            && frame.confidence.isFinite
+            && frame.confidence >= BrassTuneCore.minimumRecordingConfidence
+            && frame.rms.isFinite
+            && frame.rms >= BrassTuneCore.silenceRMSThreshold
+            && [.flat, .inTune, .sharp].contains(frame.tuningStatus)
+    }
+
+}
+
+enum NativeAudioEngineError: Error, Equatable {
+    case captureActive
+    case inputUnavailable
+    case outputUnavailable
+    case invalidToneFrequency
+    case audioSessionOwnerConflict
+    case inputTapAlreadyInstalled
+}
+
+enum NativePitchDetector {
+    static func frame(
+        from buffer: AVAudioPCMBuffer,
+        timestampMs: Int,
+        instrumentId: String,
+        referencePitchHz: Double
+    ) -> PitchFrame {
+        guard let samples = samples(from: buffer) else {
+            return PitchFrame.detected(
+                timestampMs: timestampMs,
+                frequencyHz: nil,
+                confidence: 0,
+                rms: 0,
+                instrumentId: instrumentId,
+                referencePitchHz: referencePitchHz
+            )
+        }
+        return frame(
+            samples: samples,
+            sampleRate: buffer.format.sampleRate,
+            timestampMs: timestampMs,
+            instrumentId: instrumentId,
+            referencePitchHz: referencePitchHz
+        )
+    }
+
+    static func frame(
+        samples: [Float],
+        sampleRate: Double,
+        timestampMs: Int,
+        instrumentId: String,
+        referencePitchHz: Double
+    ) -> PitchFrame {
+        guard !samples.isEmpty, sampleRate > 0 else {
+            return PitchFrame.detected(
+                timestampMs: timestampMs,
+                frequencyHz: nil,
+                confidence: 0,
+                rms: 0,
+                instrumentId: instrumentId,
+                referencePitchHz: referencePitchHz
+            )
+        }
+
+        let rms = rootMeanSquare(samples)
+        guard rms >= BrassTuneCore.silenceRMSThreshold else {
+            return PitchFrame.detected(
+                timestampMs: timestampMs,
+                frequencyHz: nil,
+                confidence: 0,
+                rms: rms,
+                instrumentId: instrumentId,
+                referencePitchHz: referencePitchHz
+            )
+        }
+
+        let mean = samples.reduce(0.0) { $0 + Double($1) } / Double(samples.count)
+        let centered = samples.map { Double($0) - mean }
+        let detection = autocorrelationPitch(samples: centered, sampleRate: sampleRate, instrumentId: instrumentId)
+        let lockedFrequency = detection.confidence >= 0.55 ? detection.frequencyHz : nil
+
+        return PitchFrame.detected(
+            timestampMs: timestampMs,
+            frequencyHz: lockedFrequency,
+            confidence: detection.confidence,
+            rms: rms,
+            instrumentId: instrumentId,
+            referencePitchHz: referencePitchHz
+        )
+    }
+
+    static func samples(from buffer: AVAudioPCMBuffer) -> [Float]? {
+        let frameLength = Int(buffer.frameLength)
+        guard frameLength > 0 else { return nil }
+
+        if let floatData = buffer.floatChannelData {
+            let channelCount = max(1, Int(buffer.format.channelCount))
+            var samples = Array(repeating: Float(0), count: frameLength)
+            for channelIndex in 0..<channelCount {
+                let channel = floatData[channelIndex]
+                for frameIndex in 0..<frameLength {
+                    samples[frameIndex] += channel[frameIndex] / Float(channelCount)
+                }
+            }
+            return samples
+        }
+
+        return nil
+    }
+
+    private static func rootMeanSquare(_ samples: [Float]) -> Double {
+        let squareSum = samples.reduce(0.0) { partial, sample in
+            let value = Double(sample)
+            return partial + value * value
+        }
+        return sqrt(squareSum / Double(samples.count))
+    }
+
+    private static func autocorrelationPitch(samples: [Double], sampleRate: Double, instrumentId: String) -> (frequencyHz: Double?, confidence: Double) {
+        guard samples.count >= 64 else { return (nil, 0) }
+        let profileRange = acousticRange(for: instrumentId)
+        let minFrequency = profileRange.minimumHz
+        let maxFrequency = profileRange.maximumHz
+        let minLag = max(1, Int(sampleRate / maxFrequency))
+        let maxLag = min(samples.count / 2, Int(sampleRate / minFrequency))
+        guard minLag < maxLag else { return (nil, 0) }
+
+        var correlations: [Int: Double] = [:]
+        correlations.reserveCapacity(maxLag - minLag + 1)
+
+        for lag in minLag...maxLag {
+            correlations[lag] = correlation(samples: samples, lag: lag)
+        }
+
+        let bestCorrelation = correlations.values.max() ?? 0
+        guard bestCorrelation > 0 else { return (nil, 0) }
+
+        let lockThreshold = max(0.82, bestCorrelation * 0.92)
+        var selectedLag = 0
+        var selectedCorrelation = 0.0
+
+        for lag in minLag...maxLag {
+            let current = correlations[lag] ?? 0
+            let previous = correlations[lag - 1] ?? current
+            let next = correlations[lag + 1] ?? current
+            if current >= lockThreshold, current >= previous, current >= next {
+                selectedLag = lag
+                selectedCorrelation = current
+                break
+            }
+        }
+
+        guard selectedLag > 0 else { return (nil, min(0.94, max(0, bestCorrelation))) }
+
+        let previous = correlations[selectedLag - 1] ?? selectedCorrelation
+        let next = correlations[selectedLag + 1] ?? selectedCorrelation
+        let divisor = previous - 2 * selectedCorrelation + next
+        let offset = divisor == 0 ? 0 : min(0.5, max(-0.5, (previous - next) / (2 * divisor)))
+        let refinedLag = Double(selectedLag) + offset
+        guard refinedLag > 0 else { return (nil, min(0.94, max(0, selectedCorrelation))) }
+        return (sampleRate / refinedLag, min(0.999, max(0, selectedCorrelation)))
+    }
+
+    static func acousticRange(for instrumentId: String) -> InstrumentAcousticRange {
+        InstrumentAcousticRange.forInstrument(instrumentId)
+    }
+
+    private static func correlation(samples: [Double], lag: Int) -> Double {
+        var numerator = 0.0
+        var energyA = 0.0
+        var energyB = 0.0
+        let count = samples.count - lag
+        guard count > 0 else { return 0 }
+        for index in 0..<count {
+            let a = samples[index]
+            let b = samples[index + lag]
+            numerator += a * b
+            energyA += a * a
+            energyB += b * b
+        }
+        guard energyA > 0, energyB > 0 else { return 0 }
+        return numerator / sqrt(energyA * energyB)
+    }
+
+}
+
+/// Click PCM is constructed once for the negotiated hardware rate and channel
+/// count. This avoids scheduling a fixed 44.1 kHz mono buffer onto a graph
+/// negotiated for a Bluetooth or multichannel route.
+struct NativeMetronomeClickBuffers {
+    let regular: AVAudioPCMBuffer
+    let accent: AVAudioPCMBuffer
+    let sampleRate: Double
+    let channelCount: AVAudioChannelCount
+    /// Each click stays within this fraction of its grid interval. This
+    /// prevents high-BPM/subdivision buffers from summing into clipped mush.
+    let maximumClickDuration: TimeInterval
+
+    init(
+        outputFormat: AVAudioFormat,
+        intervalSeconds: TimeInterval = .infinity
+    ) throws {
+        guard outputFormat.sampleRate.isFinite,
+              outputFormat.sampleRate > 0,
+              outputFormat.channelCount > 0,
+              let clickFormat = AVAudioFormat(
+                standardFormatWithSampleRate: outputFormat.sampleRate,
+                channels: outputFormat.channelCount
+              ) else {
+            throw NativeAudioEngineError.outputUnavailable
+        }
+        sampleRate = clickFormat.sampleRate
+        channelCount = clickFormat.channelCount
+        maximumClickDuration = Self.maximumDuration(intervalSeconds: intervalSeconds)
+        regular = try Self.makeBuffer(
+            format: clickFormat,
+            accent: false,
+            maximumDuration: maximumClickDuration
+        )
+        accent = try Self.makeBuffer(
+            format: clickFormat,
+            accent: true,
+            maximumDuration: maximumClickDuration
+        )
+    }
+
+    func matches(_ format: AVAudioFormat, intervalSeconds: TimeInterval = .infinity) -> Bool {
+        matchesOutputFormat(format)
+            && abs(maximumClickDuration - Self.maximumDuration(intervalSeconds: intervalSeconds)) < 0.000_1
+    }
+
+    func matchesOutputFormat(_ format: AVAudioFormat) -> Bool {
+        abs(sampleRate - format.sampleRate) < 0.5 && channelCount == format.channelCount
+    }
+
+    func buffer(accent: Bool) -> AVAudioPCMBuffer { accent ? self.accent : regular }
+
+    private static func maximumDuration(intervalSeconds: TimeInterval) -> TimeInterval {
+        let baseDuration = 0.024
+        guard intervalSeconds.isFinite, intervalSeconds > 0 else { return baseDuration }
+        // At the tightest supported 10 ms grid, 5 ms leaves headroom before
+        // the next independent player-node buffer arrives.
+        return min(baseDuration, max(0.005, intervalSeconds * 0.5))
+    }
+
+    private static func makeBuffer(
+        format: AVAudioFormat,
+        accent: Bool,
+        maximumDuration: TimeInterval
+    ) throws -> AVAudioPCMBuffer {
+        let duration = min(maximumDuration, accent ? 0.024 : 0.018)
+        let frameCount = AVAudioFrameCount((format.sampleRate * duration).rounded(.up))
+        guard frameCount > 0,
+              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount),
+              let channels = buffer.floatChannelData else {
+            throw NativeAudioEngineError.outputUnavailable
+        }
+        buffer.frameLength = frameCount
+        let frequency = accent ? 1_760.0 : 1_320.0
+        // Keep adequate headroom for route conversion and the master player
+        // volume. A raised-cosine attack/release reaches exact zero at both
+        // ends, avoiding the hard buffer seams that sounded like distortion.
+        let amplitude = accent ? 0.34 : 0.24
+        let attackDuration = min(0.0015, duration * 0.16)
+        let releaseStart = duration * 0.58
+        for frame in 0..<Int(frameCount) {
+            // Map the final sample to the exact duration so the release has
+            // a real zero endpoint even when frame count was rounded up.
+            let time = duration * Double(frame) / Double(max(1, Int(frameCount) - 1))
+            let attack = attackDuration > 0
+                ? sin(min(1, time / attackDuration) * .pi / 2)
+                : 1
+            let releaseProgress = max(0, min(1, (time - releaseStart) / max(0.000_1, duration - releaseStart)))
+            let release = cos(releaseProgress * .pi / 2)
+            let sample = Float(
+                sin(2 * Double.pi * frequency * time)
+                    * amplitude
+                    * attack
+                    * release
+                    * exp(-time * 105)
+            )
+            for channel in 0..<Int(format.channelCount) {
+                channels[channel][frame] = sample
+            }
+        }
+        return buffer
+    }
+}
+
+/// A complete measure is rendered before playback and looped by the audio
+/// graph. The app clock only drives visual state; it cannot make a dense grid
+/// stutter by arriving late or enqueueing two short clicks together.
+struct NativeMetronomePatternBuffers {
+    let countIn: AVAudioPCMBuffer?
+    let measure: AVAudioPCMBuffer
+    let measureGridTicks: Int
+
+    init(
+        outputFormat: AVAudioFormat,
+        settings: MetronomeSettings,
+        countInGridTicks: Int,
+        startingGridTick: Int
+    ) throws {
+        let clicks = try NativeMetronomeClickBuffers(
+            outputFormat: outputFormat,
+            intervalSeconds: settings.intervalSeconds
+        )
+        let ticksPerBeat = settings.subdivision.ticksPerBeat
+        measureGridTicks = max(1, settings.beatsPerMeasure * ticksPerBeat)
+        let measureTicks = measureGridTicks
+        let gridFrames = clicks.sampleRate * settings.intervalSeconds
+        guard gridFrames.isFinite, gridFrames >= 1 else {
+            throw NativeAudioEngineError.outputUnavailable
+        }
+        let countInTicks = max(0, countInGridTicks)
+        if countInTicks > 0 {
+            countIn = try Self.render(
+                ticks: countInTicks,
+                framesPerTick: gridFrames,
+                clicks: clicks,
+                isAccent: { _ in false }
+            )
+        } else {
+            countIn = nil
+        }
+        let firstMeasureTick = countInTicks > 0 ? 0 : startingGridTick
+        measure = try Self.render(
+            ticks: measureTicks,
+            framesPerTick: gridFrames,
+            clicks: clicks,
+            isAccent: { index in
+                let measureTick = (firstMeasureTick + index) % measureTicks
+                let writtenBeat = measureTick / ticksPerBeat
+                return settings.accentFirstBeat
+                    && measureTick % ticksPerBeat == 0
+                    && settings.groupingStarts.contains(writtenBeat)
+            }
+        )
+    }
+
+    private static func render(
+        ticks: Int,
+        framesPerTick: Double,
+        clicks: NativeMetronomeClickBuffers,
+        isAccent: (Int) -> Bool
+    ) throws -> AVAudioPCMBuffer {
+        let totalFrames = (Double(ticks) * framesPerTick).rounded()
+        guard totalFrames > 0, totalFrames < Double(UInt32.max),
+              let format = AVAudioFormat(
+                standardFormatWithSampleRate: clicks.sampleRate,
+                channels: clicks.channelCount
+              ),
+              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(totalFrames)),
+              let channels = buffer.floatChannelData else {
+            throw NativeAudioEngineError.outputUnavailable
+        }
+        buffer.frameLength = AVAudioFrameCount(totalFrames)
+        for channel in 0..<Int(clicks.channelCount) {
+            for frame in 0..<Int(buffer.frameLength) { channels[channel][frame] = 0 }
+        }
+        for tick in 0..<ticks {
+            let offset = Int((Double(tick) * framesPerTick).rounded())
+            let click = clicks.buffer(accent: isAccent(tick))
+            guard let source = click.floatChannelData else {
+                throw NativeAudioEngineError.outputUnavailable
+            }
+            for channel in 0..<Int(clicks.channelCount) {
+                for frame in 0..<min(Int(click.frameLength), Int(buffer.frameLength) - offset) {
+                    channels[channel][offset + frame] += source[channel][frame]
+                }
+            }
+        }
+        return buffer
+    }
+}
+
+/// The audible edge uses a host-time timestamp and a serial audio queue. UI
+/// beat state remains on MainActor, but scroll/run-loop pressure cannot cause
+/// AVAudioPlayerNode scheduling to execute on the main run loop.
+enum NativeMetronomeScheduling {
+    static func hostTime(now: UInt64 = mach_absolute_time()) -> AVAudioTime {
+        AVAudioTime(hostTime: now)
+    }
+
+    static func safeTarget(
+        _ target: UInt64,
+        now: UInt64,
+        intervalSeconds: TimeInterval,
+        minimumLeadSeconds: TimeInterval = 0.04
+    ) -> UInt64 {
+        let minimum = now &+ AVAudioTime.hostTime(forSeconds: minimumLeadSeconds)
+        guard target < minimum else { return target }
+        let interval = max(1, AVAudioTime.hostTime(forSeconds: intervalSeconds))
+        let difference = minimum - target
+        let intervalsToAdvance = difference / interval + (difference % interval == 0 ? 0 : 1)
+        return target &+ (intervalsToAdvance &* interval)
+    }
+
+    static func retirementTarget(forNewStart target: UInt64) -> UInt64 {
+        let lead = AVAudioTime.hostTime(forSeconds: 0.004)
+        return target > lead ? target - lead : target
+    }
+}
+
+enum NativeMetronomeHandoffDecision: Equatable {
+    case restoreAudibleLoop
+    case discardUnheardLoop
+    case retirePriorLoop
+    case keepCurrentLoop
+
+    static func choose(
+        now: UInt64,
+        currentStart: UInt64?,
+        hasRetiringLoop: Bool
+    ) -> Self {
+        let currentHasNotStarted = currentStart.map { now < $0 } ?? false
+        if hasRetiringLoop {
+            return currentHasNotStarted ? .restoreAudibleLoop : .retirePriorLoop
+        }
+        return currentHasNotStarted ? .discardUnheardLoop : .keepCurrentLoop
+    }
+}
+
+#if PHYSICAL_INSTRUMENTATION
+/// Stable physical-jitter evidence schema. `phase` is 0 for schedule-call
+/// return and 1 for completion; `status` is 0 pending, 1 success, 2 failure;
+/// `error` is 0 none, 1 output unavailable, 2 owner conflict, 99 other.
+private enum NativeMetronomePulseTrace {
+    struct Snapshot: Sendable {
+        let runGeneration: UInt64
+        let pulseIndex: UInt64
+        let targetHostTime: UInt64
+        let scheduleCallStartHostTime: UInt64
+        let scheduleCallEndHostTime: UInt64
+    }
+
+    static let log = OSLog(
+        subsystem: "com.aryasalem.BrassTune",
+        category: .pointsOfInterest
+    )
+
+    static func emitSchedule(_ snapshot: Snapshot) {
+        emit(snapshot, phase: 0, status: 0, error: 0, stale: false)
+    }
+
+    static func emitCompletion(
+        _ snapshot: Snapshot,
+        result: Result<Void, Error>,
+        stale: Bool
+    ) {
+        switch result {
+        case .success:
+            emit(snapshot, phase: 1, status: 1, error: 0, stale: stale)
+        case .failure(let failure):
+            let errorCode: UInt32
+            switch failure as? NativeAudioEngineError {
+            case .outputUnavailable: errorCode = 1
+            case .audioSessionOwnerConflict: errorCode = 2
+            default: errorCode = 99
+            }
+            emit(snapshot, phase: 1, status: 2, error: errorCode, stale: stale)
+        }
+    }
+
+    private static func emit(
+        _ snapshot: Snapshot,
+        phase: UInt32,
+        status: UInt32,
+        error: UInt32,
+        stale: Bool
+    ) {
+        os_signpost(
+            .event,
+            log: log,
+            name: "MetronomePulse",
+            "schema=1 phase=%{public}u run_generation=%{public}llu pulse_index=%{public}llu target_host_time=%{public}llu schedule_call_start_host_time=%{public}llu schedule_call_end_host_time=%{public}llu status=%{public}u error=%{public}u stale=%{public}u",
+            phase,
+            snapshot.runGeneration,
+            snapshot.pulseIndex,
+            snapshot.targetHostTime,
+            snapshot.scheduleCallStartHostTime,
+            snapshot.scheduleCallEndHostTime,
+            status,
+            error,
+            stale ? 1 : 0
+        )
+    }
+}
+
+private final class NativeMetronomePulseTraceContext: @unchecked Sendable {
+    private let lock = NSLock()
+    private let runGeneration: UInt64
+    private let pulseIndex: UInt64
+    private let targetHostTime: UInt64
+    private let scheduleCallStartHostTime: UInt64
+    private var scheduleCallEndHostTime: UInt64 = 0
+    private var scheduleEventEmitted = false
+
+    init(runGeneration: UInt64, pulseIndex: UInt64, targetHostTime: UInt64) {
+        self.runGeneration = runGeneration
+        self.pulseIndex = pulseIndex
+        self.targetHostTime = targetHostTime
+        scheduleCallStartHostTime = mach_absolute_time()
+    }
+
+    func markScheduleCallEnded() -> (NativeMetronomePulseTrace.Snapshot, Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+        if scheduleCallEndHostTime == 0 {
+            scheduleCallEndHostTime = mach_absolute_time()
+        }
+        let snapshot = NativeMetronomePulseTrace.Snapshot(
+            runGeneration: runGeneration,
+            pulseIndex: pulseIndex,
+            targetHostTime: targetHostTime,
+            scheduleCallStartHostTime: scheduleCallStartHostTime,
+            scheduleCallEndHostTime: scheduleCallEndHostTime
+        )
+        let shouldEmitSchedule = !scheduleEventEmitted
+        scheduleEventEmitted = true
+        return (snapshot, shouldEmitSchedule)
+    }
+}
+#endif
+
+/// An anchored monotonic timeline calculates every pulse from the same host
+/// time. Multiplication avoids cumulative floating-point drift over a long run.
+struct NativeMetronomeTimeline: Equatable, Sendable {
+    let anchorHostTime: UInt64
+    let intervalHostTicks: UInt64
+
+    init(anchorHostTime: UInt64 = mach_absolute_time(), intervalSeconds: TimeInterval) {
+        self.anchorHostTime = anchorHostTime
+        intervalHostTicks = max(1, AVAudioTime.hostTime(forSeconds: intervalSeconds))
+    }
+
+    func hostTime(forPulseIndex pulseIndex: UInt64) -> UInt64 {
+        anchorHostTime &+ (intervalHostTicks &* pulseIndex)
+    }
+
+    func firstBoundary(onOrAfter hostTime: UInt64) -> UInt64 {
+        guard hostTime > anchorHostTime else { return anchorHostTime }
+        let elapsed = hostTime - anchorHostTime
+        let index = UInt64((Double(elapsed) / Double(intervalHostTicks)).rounded(.up))
+        return self.hostTime(forPulseIndex: index)
+    }
+}
+
+/// A dedicated timer wakes slightly before each anchored pulse so the serial
+/// player queue can submit the click at the exact future host time.
+final class NativeMetronomeClock: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "com.brasstune.native.metronome-clock", qos: .userInteractive)
+    private var timer: DispatchSourceTimer?
+    private var timeline: NativeMetronomeTimeline?
+    private var nextPulseIndex: UInt64 = 1
+
+    func start(
+        intervalSeconds: TimeInterval,
+        anchorHostTime: UInt64,
+        onPulse: @escaping @Sendable (_ pulseIndex: UInt64, _ targetHostTime: UInt64) -> Void
+    ) {
+        let boundedInterval = max(0.01, intervalSeconds)
+        let leadSeconds = min(0.04, boundedInterval * 0.2)
+        let intervalNanoseconds = max(1_000_000, Int((boundedInterval * 1_000_000_000).rounded()))
+        queue.sync {
+            cancelLocked()
+            timeline = NativeMetronomeTimeline(
+                anchorHostTime: anchorHostTime,
+                intervalSeconds: boundedInterval
+            )
+            guard let timeline else { return }
+            // The first timer wakes before the first *subsequent* grid edge,
+            // not merely one interval after this method was called. Cold
+            // start anchors are intentionally in the future while the audio
+            // session/graph becomes ready; waking from `.now()` could submit
+            // pulse 1 before pulse 0 was due and invalidate its UI callback.
+            let firstTargetHostTime = timeline.hostTime(forPulseIndex: 1)
+            let leadHostTicks = AVAudioTime.hostTime(forSeconds: leadSeconds)
+            let wakeHostTime = firstTargetHostTime > leadHostTicks
+                ? firstTargetHostTime - leadHostTicks
+                : firstTargetHostTime
+            let now = mach_absolute_time()
+            let firstDelayHostTicks = wakeHostTime > now
+                ? wakeHostTime - now
+                : 0
+            let firstDeadlineNanoseconds = max(
+                1_000_000,
+                Int((AVAudioTime.seconds(forHostTime: firstDelayHostTicks) * 1_000_000_000).rounded())
+            )
+            nextPulseIndex = 1
+            let source = DispatchSource.makeTimerSource(queue: queue)
+            source.schedule(
+                deadline: .now() + .nanoseconds(firstDeadlineNanoseconds),
+                repeating: .nanoseconds(intervalNanoseconds),
+                leeway: .milliseconds(1)
+            )
+            source.setEventHandler { [weak self] in
+                guard let self, let timeline = self.timeline else { return }
+                // Dispatch timers may coalesce while the app is busy. Never
+                // enqueue a click for a host time that has already passed;
+                // skip missed grid positions and resume at the first future
+                // musical edge instead of trying to catch up in a burst.
+                let now = mach_absolute_time()
+                let elapsed = now > timeline.anchorHostTime ? now - timeline.anchorHostTime : 0
+                var firstFuture = UInt64((Double(elapsed) / Double(timeline.intervalHostTicks)).rounded(.up))
+                if timeline.hostTime(forPulseIndex: firstFuture) <= now { firstFuture &+= 1 }
+                let pulseIndex = max(self.nextPulseIndex, firstFuture)
+                let targetHostTime = timeline.hostTime(forPulseIndex: pulseIndex)
+                self.nextPulseIndex = pulseIndex &+ 1
+                onPulse(pulseIndex, targetHostTime)
+            }
+            timer = source
+            source.resume()
+        }
+    }
+
+    func stop() {
+        queue.sync { cancelLocked() }
+    }
+
+    /// The next unconsumed edge of the old timeline. A settings transition
+    /// adopts this edge as its new anchor instead of restarting at `now`.
+    func nextScheduledTargetHostTime(now: UInt64 = mach_absolute_time()) -> UInt64? {
+        queue.sync {
+            guard let timeline else { return nil }
+            let elapsed = now > timeline.anchorHostTime ? now - timeline.anchorHostTime : 0
+            var index = UInt64((Double(elapsed) / Double(timeline.intervalHostTicks)).rounded(.up))
+            // `nextPulseIndex` advances when the timer dispatches ahead of
+            // the edge. A settings change in that lead window must preserve
+            // the already-dispatched future edge instead of skipping it.
+            if timeline.hostTime(forPulseIndex: index) <= now { index &+= 1 }
+            return timeline.hostTime(forPulseIndex: index)
+        }
+    }
+
+    private func cancelLocked() {
+        timer?.setEventHandler {}
+        timer?.cancel()
+        timer = nil
+        timeline = nil
+    }
+}
+
+struct NativeMetronomeGraphHooks: Sendable {
+    let prepare: @Sendable () throws -> Void
+    let schedule: @Sendable (
+        _ targetHostTime: UInt64,
+        _ completion: @escaping @Sendable (Result<Void, Error>) -> Void
+    ) -> Void
+    let play: @Sendable () -> Void
+    let stop: @Sendable () -> Void
+    let reset: @Sendable () -> Void
+}
+
+private actor NativeMetronomeAudioGraph {
+    private var engine = AVAudioEngine()
+    private var player = AVAudioPlayerNode()
+    private var isAttached = false
+    private var buffers: NativeMetronomeClickBuffers?
+    private var pattern: NativeMetronomePatternBuffers?
+    private var retiringPlayer: AVAudioPlayerNode?
+    private var retirementTask: Task<Void, Never>?
+    private var retirementGeneration: UInt64 = 0
+    private var playerScheduledStartHostTime: UInt64?
+    private let hooks: NativeMetronomeGraphHooks?
+
+    init(hooks: NativeMetronomeGraphHooks? = nil) {
+        self.hooks = hooks
+    }
+
+    func schedule(
+        volume: Float,
+        accent: Bool,
+        settings: MetronomeSettings,
+        countInGridTicks: Int,
+        startingGridTick: Int,
+        hostTime: UInt64,
+        completion: @escaping @Sendable (Result<Void, Error>) -> Void
+    ) throws -> UInt64 {
+        if let hooks {
+            try hooks.prepare()
+            NativeNonblockingAudioScheduling.scheduleAndPlay(
+                schedule: { hooks.schedule(hostTime, completion) },
+                play: hooks.play
+            )
+            return hostTime
+        }
+        try prepareIfNeeded(intervalSeconds: settings.intervalSeconds)
+        let nextPattern = try NativeMetronomePatternBuffers(
+            outputFormat: engine.outputNode.inputFormat(forBus: 0),
+            settings: settings,
+            countInGridTicks: countInGridTicks,
+            startingGridTick: startingGridTick
+        )
+        // Render before choosing the future edge. The previous measure stays
+        // audible while a tempo edit is prepared and until the replacement
+        // starts; stopping it here would create a noticeable dead interval.
+        let acceptedHostTime = NativeMetronomeScheduling.safeTarget(
+            hostTime,
+            now: mach_absolute_time(),
+            intervalSeconds: settings.intervalSeconds
+        )
+        retirementTask?.cancel()
+        retirementTask = nil
+        retirementGeneration &+= 1
+        switch NativeMetronomeHandoffDecision.choose(
+            now: mach_absolute_time(),
+            currentStart: playerScheduledStartHostTime,
+            hasRetiringLoop: retiringPlayer != nil
+        ) {
+        case .restoreAudibleLoop:
+            // B has only been queued; A is still the audible loop. Discard
+            // unheard B and use A as the source for the new A→C handoff.
+            let unheardPlayer = player
+            unheardPlayer.stop()
+            engine.detach(unheardPlayer)
+            if let retiringPlayer { player = retiringPlayer }
+            retiringPlayer = nil
+            playerScheduledStartHostTime = nil
+        case .discardUnheardLoop:
+            player.stop()
+            playerScheduledStartHostTime = nil
+        case .retirePriorLoop:
+            if let retiringPlayer { retire(retiringPlayer) }
+        case .keepCurrentLoop:
+            break
+        }
+        let oldPlayer = player.isPlaying ? player : nil
+        let nextPlayer: AVAudioPlayerNode
+        if oldPlayer != nil {
+            nextPlayer = AVAudioPlayerNode()
+            engine.attach(nextPlayer)
+            engine.connect(nextPlayer, to: engine.mainMixerNode, format: nextPattern.measure.format)
+        } else {
+            nextPlayer = player
+            nextPlayer.stop()
+        }
+        nextPlayer.volume = volume
+        if let countIn = nextPattern.countIn {
+            nextPlayer.scheduleBuffer(countIn, at: nil, options: [], completionHandler: nil)
+        }
+        nextPlayer.scheduleBuffer(
+            nextPattern.measure,
+            at: nil,
+            options: .loops,
+            completionHandler: nil
+        )
+        nextPlayer.play(at: NativeMetronomeScheduling.hostTime(now: acceptedHostTime))
+        player = nextPlayer
+        playerScheduledStartHostTime = acceptedHostTime
+        if let oldPlayer {
+            retiringPlayer = oldPlayer
+            retirementGeneration &+= 1
+            let generation = retirementGeneration
+            let retirementTarget = NativeMetronomeScheduling.retirementTarget(
+                forNewStart: acceptedHostTime
+            )
+            let now = mach_absolute_time()
+            let delay = retirementTarget > now
+                ? AVAudioTime.seconds(forHostTime: retirementTarget - now)
+                : 0
+            retirementTask = Task { [weak self] in
+                try? await Task.sleep(for: .seconds(delay))
+                guard !Task.isCancelled else { return }
+                await self?.retireIfCurrent(generation: generation)
+            }
+        }
+        pattern = nextPattern
+        // `AVAudioPlayerNode`'s completion handler means the click was
+        // consumed (or interrupted), not that it was accepted. Report a
+        // successful submission here so the UI clock stays on its target edge.
+        completion(.success(()))
+        return acceptedHostTime
+    }
+
+    func stop() {
+        if let hooks {
+            hooks.stop()
+            return
+        }
+        retirementGeneration &+= 1
+        retirementTask?.cancel()
+        retirementTask = nil
+        if let retiringPlayer { retire(retiringPlayer) }
+        player.stop()
+        engine.stop()
+        pattern = nil
+        playerScheduledStartHostTime = nil
+    }
+
+    func reset() {
+        if let hooks {
+            hooks.reset()
+            return
+        }
+        retirementGeneration &+= 1
+        retirementTask?.cancel()
+        retirementTask = nil
+        retiringPlayer = nil
+        // A media-services reset invalidates the old AVFoundation graph. Do
+        // not message those objects again; replace them on this actor.
+        engine = AVAudioEngine()
+        player = AVAudioPlayerNode()
+        isAttached = false
+        buffers = nil
+        pattern = nil
+        playerScheduledStartHostTime = nil
+    }
+
+    private func retireIfCurrent(generation: UInt64) {
+        guard generation == retirementGeneration,
+              let retiringPlayer else { return }
+        retire(retiringPlayer)
+        retirementTask = nil
+    }
+
+    private func retire(_ node: AVAudioPlayerNode) {
+        node.stop()
+        engine.detach(node)
+        retiringPlayer = nil
+    }
+
+    private func prepareIfNeeded(intervalSeconds: TimeInterval) throws {
+        if !isAttached {
+            engine.attach(player)
+            isAttached = true
+        }
+        let outputFormat = engine.outputNode.inputFormat(forBus: 0)
+        if buffers?.matchesOutputFormat(outputFormat) != true {
+            engine.stop()
+            engine.disconnectNodeOutput(player)
+            let newBuffers = try NativeMetronomeClickBuffers(
+                outputFormat: outputFormat,
+                intervalSeconds: intervalSeconds
+            )
+            engine.connect(player, to: engine.mainMixerNode, format: AVAudioFormat(
+                standardFormatWithSampleRate: newBuffers.sampleRate,
+                channels: newBuffers.channelCount
+            ))
+            buffers = newBuffers
+        } else if buffers?.matches(outputFormat, intervalSeconds: intervalSeconds) != true {
+            // PCM duration can change with tempo/subdivision while its
+            // hardware format remains valid. Replacing only the future click
+            // buffers avoids stopping a running metronome during that edit.
+            buffers = try NativeMetronomeClickBuffers(
+                outputFormat: outputFormat,
+                intervalSeconds: intervalSeconds
+            )
+        }
+        if !engine.isRunning { try engine.start() }
+    }
+}
+
+typealias NativeMetronomeSchedule = (
+    _ volume: Float,
+    _ accent: Bool,
+    _ hostTime: UInt64,
+    _ completion: @escaping @Sendable (Result<Void, Error>) -> Void
+) -> Void
+
+/// Separates an override's synchronous scheduling rejection from a later
+/// playback callback. Only immediate rejections suppress a target-timed UI
+/// pulse; consumption callbacks cannot shift a pulse one buffer late.
+private final class NativeMetronomeScheduleOutcome: @unchecked Sendable {
+    private let lock = NSLock()
+    private var result: Result<Void, Error>?
+
+    func record(_ result: Result<Void, Error>) {
+        lock.lock()
+        self.result = result
+        lock.unlock()
+    }
+
+    var failedSynchronously: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if case .failure? = result { return true }
+        return false
+    }
+}
+
+@MainActor
+final class NativeMetronomeOutput {
+    enum LifecycleEvent: Equatable {
+        case routeChanged
+        case interruption
+        case mediaServicesReset
+        case outputFailure
+    }
+
+    static let initialSchedulingMarginSeconds: TimeInterval = 0.1
+
+    private let graph: NativeMetronomeAudioGraph
+    private let audioSessionCoordinator: NativeAudioSessionCoordinator
+    private let scheduleOverride: NativeMetronomeSchedule?
+    private let isContinuousGraph: Bool
+    private let onScheduleResult: ((UInt64) -> Void)?
+    private let onScheduleSubmitted: (() -> Void)?
+    private let playHapticOverride: ((Bool) -> Void)?
+    private let accentedHapticGenerator = UIImpactFeedbackGenerator(style: .medium)
+    private let regularHapticGenerator = UIImpactFeedbackGenerator(style: .light)
+    private var lifecycleHandler: ((LifecycleEvent) -> Void)?
+    private var runGeneration: UInt64 = 0
+    // Bumps for every scheduled pulse, including a tempo replacement that
+    // deliberately keeps the AVAudioSession owner alive. It invalidates an
+    // old visual/haptic callback without needing to tear down audio.
+    private var pulseGeneration: UInt64 = 0
+    /// One future buffer may already be accepted by AVAudioPlayerNode while a
+    /// tempo edit arrives. A replacement adopts that exact audio edge rather
+    /// than enqueueing a second click at the same host time.
+    private var acceptedPulseHostTime: UInt64?
+    private var graphCommandTail: Task<Void, Never>?
+    @Published private(set) var lastFailure: NativeAudioEngineError?
+    nonisolated(unsafe) private var mediaServicesResetObserver: NSObjectProtocol?
+    nonisolated(unsafe) private var routeChangeObserver: NSObjectProtocol?
+    nonisolated(unsafe) private var interruptionObserver: NSObjectProtocol?
+
+    init(
+        audioSessionCoordinator: NativeAudioSessionCoordinator = .shared,
+        scheduleOverride: NativeMetronomeSchedule? = nil,
+        onScheduleResult: ((UInt64) -> Void)? = nil,
+        onScheduleSubmitted: (() -> Void)? = nil,
+        graphHooks: NativeMetronomeGraphHooks? = nil,
+        playHaptic: ((Bool) -> Void)? = nil
+    ) {
+        graph = NativeMetronomeAudioGraph(hooks: graphHooks)
+        self.audioSessionCoordinator = audioSessionCoordinator
+        self.scheduleOverride = scheduleOverride
+        isContinuousGraph = graphHooks == nil && scheduleOverride == nil
+        self.onScheduleResult = onScheduleResult
+        self.onScheduleSubmitted = onScheduleSubmitted
+        self.playHapticOverride = playHaptic
+        // Generators are retained for the whole output lifetime. Preparing
+        // them here and after each pulse avoids allocating on the click path.
+        accentedHapticGenerator.prepare()
+        regularHapticGenerator.prepare()
+        mediaServicesResetObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.mediaServicesWereResetNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.handleMediaServicesReset()
+            }
+        }
+        routeChangeObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            let rawReason = notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt
+            Task { @MainActor in
+                self?.handleRouteChange(rawReason: rawReason)
+            }
+        }
+        interruptionObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.interruptionNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            let rawType = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
+            Task { @MainActor in
+                self?.handleInterruption(rawType: rawType)
+            }
+        }
+    }
+
+    deinit {
+        if let mediaServicesResetObserver {
+            NotificationCenter.default.removeObserver(mediaServicesResetObserver)
+        }
+        if let routeChangeObserver {
+            NotificationCenter.default.removeObserver(routeChangeObserver)
+        }
+        if let interruptionObserver {
+            NotificationCenter.default.removeObserver(interruptionObserver)
+        }
+    }
+
+    func setLifecycleHandler(_ handler: @escaping (LifecycleEvent) -> Void) {
+        lifecycleHandler = handler
+    }
+
+    func playTick(
+        settings: MetronomeSettings,
+        accent: Bool,
+        hostTime: UInt64 = mach_absolute_time(),
+        pulseIndex: UInt64 = 0,
+        onInitialPulseScheduled: (@MainActor @Sendable (UInt64) -> Void)? = nil,
+        transitionBoundary: (@MainActor @Sendable (UInt64) -> UInt64)? = nil,
+        onPulseDue: (@MainActor @Sendable (UInt64) -> Void)? = nil,
+        allowAudibleDuringCapture: Bool = false,
+        countInGridTicks: Int = 0,
+        startingGridTick: Int = 0,
+        onAudiblePulseScheduled: (@MainActor @Sendable (UInt64) -> Void)? = nil
+    ) {
+        // A click can be enqueued ahead of its edge, but visual and haptic
+        // feedback must not lead it. Both are dispatched at the same target
+        // host time after the graph/session route has accepted the schedule.
+        pulseGeneration &+= 1
+        let scheduledPulseGeneration = pulseGeneration
+        let publishPulse: @MainActor @Sendable (UInt64) -> Void = { [weak self] targetHostTime in
+            guard let self else { return }
+            let generation = self.runGeneration
+            let now = mach_absolute_time()
+            guard targetHostTime > now else {
+                if settings.hapticsEnabled { self.playHaptic(accent: accent) }
+                onPulseDue?(targetHostTime)
+                if self.acceptedPulseHostTime == targetHostTime {
+                    self.acceptedPulseHostTime = nil
+                }
+                return
+            }
+            if settings.hapticsEnabled { self.prepareHaptic(accent: accent) }
+            let delay = AVAudioTime.seconds(forHostTime: targetHostTime - now)
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self,
+                      generation == self.runGeneration,
+                      scheduledPulseGeneration == self.pulseGeneration else { return }
+                if settings.hapticsEnabled { self.playHaptic(accent: accent) }
+                onPulseDue?(targetHostTime)
+                if self.acceptedPulseHostTime == targetHostTime {
+                    self.acceptedPulseHostTime = nil
+                }
+            }
+        }
+        guard allowAudibleDuringCapture || !audioSessionCoordinator.isActive(.capture) else {
+            stop()
+            onInitialPulseScheduled?(hostTime)
+            publishPulse(hostTime)
+            return
+        }
+
+        guard !settings.visualOnly, !settings.muted, settings.volume > 0 else {
+            stop()
+            onInitialPulseScheduled?(hostTime)
+            publishPulse(hostTime)
+            return
+        }
+        do {
+            let wasAlreadyActive = audioSessionCoordinator.isActive(.metronome)
+            let acquireTask = try audioSessionCoordinator.acquireTask(
+                .metronome,
+                configuration: .metronome
+            )
+            if !wasAlreadyActive {
+                runGeneration &+= 1
+            }
+            let scheduleGeneration = runGeneration
+            lastFailure = nil
+            let safeVolume = Float(min(1, max(0, settings.volume)))
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                do {
+                    _ = try await acquireTask.value
+                } catch {
+                    guard scheduleGeneration == self.runGeneration else { return }
+                    self.audioSessionCoordinator.rollbackLogicalOwner(.metronome)
+                    self.reportFailure(error)
+                    return
+                }
+                guard scheduleGeneration == self.runGeneration,
+                      scheduledPulseGeneration == self.pulseGeneration,
+                      self.audioSessionCoordinator.isActive(.metronome) else {
+                    // `stop()` already released this run's logical owner.
+                    // Releasing by bare owner here can instead revoke a newer
+                    // rapid-restart run that acquired while this await was
+                    // pending.
+                    return
+                }
+                // The first click cannot be scheduled until the asynchronous
+                // session and graph setup are ready. Re-anchor it far enough
+                // ahead of the host clock for AVAudioPlayerNode to accept it.
+                let scheduledHostTime: UInt64
+                if onInitialPulseScheduled != nil {
+                    let readyHostTime = max(
+                        hostTime,
+                        mach_absolute_time() &+ AVAudioTime.hostTime(
+                            forSeconds: Self.initialSchedulingMarginSeconds
+                        )
+                    )
+                    scheduledHostTime = transitionBoundary?(readyHostTime) ?? readyHostTime
+                } else {
+                    scheduledHostTime = hostTime
+                }
+                if wasAlreadyActive,
+                   self.acceptedPulseHostTime == scheduledHostTime,
+                   !self.isContinuousGraph {
+                    // The old graph buffer remains the sole audible click.
+                    // This logical replacement owns its UI/clock callback.
+                    onAudiblePulseScheduled?(scheduledHostTime)
+                    onInitialPulseScheduled?(scheduledHostTime)
+                    publishPulse(scheduledHostTime)
+                    return
+                }
+                if wasAlreadyActive, self.isContinuousGraph,
+                   onInitialPulseScheduled == nil {
+                    // The audio thread already loops a complete PCM measure.
+                    // A busy app clock can delay these UI calls without ever
+                    // moving or duplicating an audible subdivision.
+                    onAudiblePulseScheduled?(scheduledHostTime)
+                    publishPulse(scheduledHostTime)
+                    return
+                }
+                let scheduleOutcome = NativeMetronomeScheduleOutcome()
+#if PHYSICAL_INSTRUMENTATION
+                let traceContext = NativeMetronomePulseTraceContext(
+                    runGeneration: scheduleGeneration,
+                    pulseIndex: pulseIndex,
+                    targetHostTime: hostTime
+                )
+                let completion: @Sendable (Result<Void, Error>) -> Void = { [weak self] result in
+                    scheduleOutcome.record(result)
+                    let (snapshot, shouldEmitSchedule) = traceContext.markScheduleCallEnded()
+                    if shouldEmitSchedule { NativeMetronomePulseTrace.emitSchedule(snapshot) }
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        self.handleScheduleResult(
+                            result,
+                            generation: scheduleGeneration,
+                            trace: snapshot
+                        )
+                    }
+                }
+#else
+                let completion: @Sendable (Result<Void, Error>) -> Void = { [weak self] result in
+                    scheduleOutcome.record(result)
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        self.handleScheduleResult(result, generation: scheduleGeneration)
+                    }
+                }
+#endif
+                var acceptedHostTime = scheduledHostTime
+                if let scheduleOverride = self.scheduleOverride {
+                    guard scheduleGeneration == self.runGeneration,
+                          scheduledPulseGeneration == self.pulseGeneration else { return }
+                    scheduleOverride(safeVolume, accent, scheduledHostTime, completion)
+                } else {
+                    do {
+                        guard scheduleGeneration == self.runGeneration,
+                              scheduledPulseGeneration == self.pulseGeneration else { return }
+                        acceptedHostTime = try await self.enqueueGraphSchedule(
+                            volume: safeVolume,
+                            accent: accent,
+                            settings: settings,
+                            countInGridTicks: countInGridTicks,
+                            startingGridTick: startingGridTick,
+                            hostTime: scheduledHostTime,
+                            completion: completion
+                        )
+                    } catch {
+                        completion(.failure(error))
+                        // No audio buffer was accepted by the graph, so do
+                        // not publish an optimistic visual/haptic pulse.
+                        return
+                    }
+                }
+                guard scheduleGeneration == self.runGeneration,
+                      scheduledPulseGeneration == self.pulseGeneration else { return }
+                guard !scheduleOutcome.failedSynchronously else { return }
+                self.acceptedPulseHostTime = acceptedHostTime
+                self.onScheduleSubmitted?()
+                onAudiblePulseScheduled?(acceptedHostTime)
+                onInitialPulseScheduled?(acceptedHostTime)
+                publishPulse(acceptedHostTime)
+#if PHYSICAL_INSTRUMENTATION
+                let (snapshot, shouldEmitSchedule) = traceContext.markScheduleCallEnded()
+                if shouldEmitSchedule { NativeMetronomePulseTrace.emitSchedule(snapshot) }
+#endif
+            }
+        } catch {
+            reportFailure(error)
+        }
+    }
+
+    private func playHaptic(accent: Bool) {
+        if let playHapticOverride {
+            playHapticOverride(accent)
+            return
+        }
+        let generator = accent ? accentedHapticGenerator : regularHapticGenerator
+        generator.impactOccurred(intensity: accent ? 0.85 : 0.55)
+        generator.prepare()
+    }
+
+    private func prepareHaptic(accent: Bool) {
+        guard playHapticOverride == nil else { return }
+        (accent ? accentedHapticGenerator : regularHapticGenerator).prepare()
+    }
+
+    func stop() {
+        // Visual-only timers and late callbacks call this frequently. Do not
+        // synchronously touch the AVAudioEngine unless this instance still
+        // owns an audible metronome session.
+        runGeneration &+= 1
+        acceptedPulseHostTime = nil
+        guard audioSessionCoordinator.isActive(.metronome) else { return }
+        audioSessionCoordinator.release(.metronome)
+        enqueueGraphCommand { graph in await graph.stop() }
+    }
+
+    func handleMediaServicesReset() {
+        stopAndReset(for: .mediaServicesReset, invalidatingMediaServices: true)
+    }
+
+    func handleRouteChange(rawReason: UInt?) {
+        guard rawReason != AVAudioSession.RouteChangeReason.categoryChange.rawValue else { return }
+        stopAndReset(for: .routeChanged)
+    }
+
+    func handleInterruption(rawType: UInt?) {
+        guard rawType == AVAudioSession.InterruptionType.began.rawValue else { return }
+        stopAndReset(for: .interruption)
+    }
+
+    private func stopAndReset(
+        for event: LifecycleEvent,
+        invalidatingMediaServices: Bool = false
+    ) {
+        runGeneration &+= 1
+        acceptedPulseHostTime = nil
+        if invalidatingMediaServices {
+            audioSessionCoordinator.invalidateAfterMediaServicesReset()
+        } else {
+            audioSessionCoordinator.invalidateSessionConfiguration()
+        }
+        audioSessionCoordinator.release(.metronome, deactivation: .immediate)
+        enqueueGraphCommand { graph in await graph.reset() }
+        lastFailure = .outputUnavailable
+        lifecycleHandler?(event)
+    }
+
+    private func handleScheduleResult(_ result: Result<Void, Error>, generation: UInt64) {
+        onScheduleResult?(generation)
+        guard generation == runGeneration,
+              audioSessionCoordinator.isActive(.metronome) else { return }
+        if case .failure(let error) = result {
+            reportFailure(error)
+        }
+    }
+
+    private func reportFailure(_ error: Error) {
+        lastFailure = (error as? NativeAudioEngineError) ?? .outputUnavailable
+        stopAndReset(for: .outputFailure)
+    }
+
+    private func enqueueGraphSchedule(
+        volume: Float,
+        accent: Bool,
+        settings: MetronomeSettings,
+        countInGridTicks: Int,
+        startingGridTick: Int,
+        hostTime: UInt64,
+        completion: @escaping @Sendable (Result<Void, Error>) -> Void
+    ) async throws -> UInt64 {
+        let previous = graphCommandTail
+        let graph = graph
+        let task = Task<UInt64, Error> {
+            await previous?.value
+            return try await graph.schedule(
+                volume: volume,
+                accent: accent,
+                settings: settings,
+                countInGridTicks: countInGridTicks,
+                startingGridTick: startingGridTick,
+                hostTime: hostTime,
+                completion: completion
+            )
+        }
+        graphCommandTail = Task { _ = try? await task.value }
+        return try await task.value
+    }
+
+    private func enqueueGraphCommand(
+        _ operation: @escaping @Sendable (NativeMetronomeAudioGraph) async -> Void
+    ) {
+        let previous = graphCommandTail
+        let graph = graph
+        let task = Task<Void, Never> {
+            await previous?.value
+            await operation(graph)
+        }
+        graphCommandTail = task
+    }
+
+#if PHYSICAL_INSTRUMENTATION
+    private func handleScheduleResult(
+        _ result: Result<Void, Error>,
+        generation: UInt64,
+        trace: NativeMetronomePulseTrace.Snapshot
+    ) {
+        NativeMetronomePulseTrace.emitCompletion(
+            trace,
+            result: result,
+            stale: generation != runGeneration || !audioSessionCoordinator.isActive(.metronome)
+        )
+        handleScheduleResult(result, generation: generation)
+    }
+#endif
+}
